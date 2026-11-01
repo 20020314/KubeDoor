@@ -1,5 +1,5 @@
 # Build from the repository root; see build.sh.
-FROM registry.cn-shenzhen.aliyuncs.com/starsl/python:3.13-slim
+FROM docker.io/library/python:3.13-slim
 ARG TARGETARCH
 ARG KUBECTL_VERSION=v1.37.1
 ARG KUBECTL_SHA256

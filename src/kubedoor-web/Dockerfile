@@ -1,4 +1,4 @@
-FROM registry.cn-shenzhen.aliyuncs.com/starsl/node:24-bookworm-slim AS builder
+FROM docker.io/library/node:24-bookworm-slim AS builder
 WORKDIR /kubedoor-web
 # 使用 Debian 构建环境，减少新版 Alpine 与旧构建机内核的兼容问题。
 RUN npm config set registry https://registry.npmmirror.com --location=global && \
@@ -12,6 +12,6 @@ COPY . .
 RUN pnpm run build
 
 # 官方 nginx 镜像(自带 auth_request 模块);nginx 配置由部署时的 ConfigMap nginx-config 挂载
-FROM registry.cn-shenzhen.aliyuncs.com/starsl/nginx:alpine
+FROM docker.io/library/nginx:alpine
 WORKDIR /www
 COPY --from=builder /kubedoor-web/dist dist/

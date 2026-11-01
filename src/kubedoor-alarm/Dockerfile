@@ -1,4 +1,4 @@
-FROM registry.cn-shenzhen.aliyuncs.com/starsl/python:3.14-alpine
+FROM docker.io/library/python:3.14-alpine
 ADD . /
 WORKDIR /
 # psycopg 在 alpine(musl) 上需要编译:补 gcc、musl-dev、postgresql 开发头与 libpq 运行库
