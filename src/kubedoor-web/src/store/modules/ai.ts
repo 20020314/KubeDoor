@@ -1,0 +1,1301 @@
+import { computed, ref, watch } from "vue";
+import { defineStore } from "pinia";
+import { store } from "@/store";
+import {
+  aiApi,
+  streamAIEvents,
+  AIRequestError,
+  type AIBootstrap,
+  type AIEvent,
+  type AIMcpServer,
+  type AIMemorySummary,
+  type AIMessage,
+  type AIProvider,
+  type AIReasoningEffort,
+  type AIRun,
+  type AIScope,
+  type AISession,
+  type AIUsage
+} from "@/api/ai";
+import {
+  isTerminalRun,
+  newAIId,
+  normalizeAITool,
+  providerStorageKey,
+  safeAIText
+} from "@/utils/ai";
+
+const emptyScope = (): AIScope => ({
+  env: "",
+  namespace: null,
+  deployment: null,
+  pod: null
+});
+const defaultProvider = (): AIProvider => ({
+  base_url: "https://api.openai.com/v1",
+  api_key: "",
+  model: "",
+  max_input_tokens: null,
+  max_output_tokens: null,
+  compression_ratio: null,
+  reasoning_effort: null
+});
+/** 浏览器里保存的上下文设置：旧数据没有这些字段时为 null，由服务端按模型推断 */
+const savedNumber = (value: unknown) =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+const savedEffort = (value: unknown): AIReasoningEffort | null =>
+  value === "off" || value === "low" || value === "high" || value === "max"
+    ? value
+    : null;
+const errorText = (error: unknown) =>
+  error instanceof Error ? error.message : "请求失败，请稍后重试。";
+
+export const useAIStore = defineStore("kubedoor-ai", () => {
+  const visible = ref(false);
+  const mounted = ref(false);
+  const loading = ref(false);
+  const initialized = ref(false);
+  const bootstrap = ref<AIBootstrap | null>(null);
+  const provider = ref<AIProvider>(defaultProvider());
+  const sessions = ref<AISession[]>([]);
+  const sessionId = ref("");
+  const sessionLoading = ref(false);
+  const sessionReady = ref(true);
+  const messages = ref<AIMessage[]>([]);
+  const scope = ref<AIScope>(emptyScope());
+  const skillIds = ref<string[]>([]);
+  const selectedMemories = ref<AIMemorySummary[]>([]);
+  const summarizingMemory = ref(false);
+  const autoApprove = ref(false);
+  const activeRun = ref<AIRun | null>(null);
+  /** 当前会话最近一轮的用量（会话详情和 done 事件带回），用来显示上下文占用 */
+  const contextUsage = ref<AIUsage | null>(null);
+  /** 页面上「问 AI」预填的问题，对话框取走后清空 */
+  const pendingInput = ref("");
+  /** 当前账号自己接入的外部 MCP（MCP 管理）；按钮上显示启用的个数 */
+  const mcpServers = ref<AIMcpServer[]>([]);
+  const enabledMcpCount = computed(
+    () => mcpServers.value.filter(item => item.enabled).length
+  );
+  const submitting = ref(false);
+  const deciding = ref("");
+  const cancelling = ref(false);
+  const error = ref("");
+  const streamError = ref("");
+  const streamState = ref("idle");
+  const lastSeq = ref(0);
+  /** 当前用户对某个集群的权限(系统管理员一律管理员;看不到的集群不在 bootstrap 里) */
+  const clusterPermission = (env?: string) => {
+    const global = bootstrap.value?.permission;
+    if (global === "admin") return "admin";
+    const cluster = bootstrap.value?.clusters.find(item => item.env === env);
+    if (!cluster) return "none";
+    // 旧版 AI 服务不返回集群级权限,按全局权限处理
+    return (
+      cluster.permission ??
+      (global === "cluster_admin" ? "admin" : global === "rw" ? "rw" : "read")
+    );
+  };
+  /** 当前会话所在集群是只读权限(只用于提示;能不能执行、要不要审批都由服务端按「权限与审批」判断) */
+  const readOnly = computed(
+    () =>
+      clusterPermission(activeRun.value?.scope?.env || scope.value.env) ===
+      "read"
+  );
+  /** 与集群无关的写操作(共享记忆)只看全局权限 */
+  const globalWritable = computed(() =>
+    ["admin", "cluster_admin", "rw"].includes(bootstrap.value?.permission ?? "")
+  );
+  const configured = computed(
+    () => !!provider.value.base_url.trim() && !!provider.value.model.trim()
+  );
+  const busy = computed(
+    () =>
+      submitting.value ||
+      (!!activeRun.value && !isTerminalRun(activeRun.value.status))
+  );
+  const selectedCluster = computed(() =>
+    bootstrap.value?.clusters.find(cluster => cluster.env === scope.value.env)
+  );
+  const clusterAvailable = computed(() => !!selectedCluster.value);
+  const liveAvailable = computed(
+    () =>
+      !!selectedCluster.value &&
+      (selectedCluster.value.online || selectedCluster.value.configured)
+  );
+  const pendingTools = computed(() =>
+    messages.value
+      .flatMap(message => message.tools || [])
+      .filter(tool => tool.pending)
+  );
+  let streamController: AbortController | null = null;
+  let streamGeneration = 0;
+  let sessionController: AbortController | null = null;
+  let sessionGeneration = 0;
+  let listGeneration = 0;
+  let submissionGeneration = 0;
+  let summaryGeneration = 0;
+  const sessionCache = new Map<string, { data: AISession; weight: number }>();
+  const draftScopes = new Map<string, AIScope>();
+  const titleGenerations = new Map<string, number>();
+  // Keep an asynchronously generated title visible while an older session
+  // list response still contains the server's previous default title.
+  const autoTitleOverrides = new Map<string, string>();
+  let owner = "";
+  let assistantId = "";
+  const approvalReady = ref(false);
+  const autoApproving = ref(false);
+  const approvalActionIds = new Set<string>();
+  const settledActions = new Set<string>();
+  let approvalGeneration = 0;
+  let runStatusRevision = 0;
+  let recoveredEventSeq = 0;
+  const automaticPending = computed(() =>
+    pendingTools.value.filter(
+      tool =>
+        tool.action_id &&
+        approvalActionIds.has(tool.action_id) &&
+        !settledActions.has(`${activeRun.value?.id}:${tool.action_id}`)
+    )
+  );
+
+  function resetApprovalState() {
+    approvalGeneration++;
+    runStatusRevision++;
+    approvalReady.value = false;
+    approvalActionIds.clear();
+    recoveredEventSeq = 0;
+    autoApproving.value = false;
+    deciding.value = "";
+    cancelling.value = false;
+  }
+
+  // 自动批准不看集群权限:进入待审批的动作已经过服务端的权限检查,批准时服务端还会再复核;
+  // 高危命令也一样自动批准(用户勾选了就是确认过)
+  watch(
+    () => [
+      autoApprove.value,
+      approvalReady.value,
+      autoApproving.value,
+      activeRun.value?.id,
+      activeRun.value?.status,
+      deciding.value,
+      cancelling.value,
+      automaticPending.value.map(tool => tool.action_id).join(",")
+    ],
+    () => void approveAutomatically()
+  );
+
+  async function approveAutomatically() {
+    if (
+      !autoApprove.value ||
+      !approvalReady.value ||
+      !sessionReady.value ||
+      autoApproving.value ||
+      deciding.value ||
+      cancelling.value ||
+      activeRun.value?.status !== "waiting_approval"
+    )
+      return;
+    const actionId = automaticPending.value[0]?.action_id;
+    if (!actionId) return;
+    const runId = activeRun.value.id;
+    const generation = approvalGeneration;
+    const readyRevision = runStatusRevision;
+    let submitted = false;
+    const canContinue = () =>
+      autoApprove.value &&
+      sessionReady.value &&
+      !cancelling.value &&
+      !deciding.value &&
+      generation === approvalGeneration &&
+      activeRun.value?.id === runId &&
+      activeRun.value.status === "waiting_approval" &&
+      automaticPending.value.some(tool => tool.action_id === actionId);
+    autoApproving.value = true;
+    // An approval event arrives before the server has saved its checkpoint.
+    // Consume one confirmed waiting status for each graph resume, even when
+    // several parallel actions are visible in the tool group.
+    approvalReady.value = false;
+    try {
+      const delays = [150, 300, 600, 1200];
+      for (let attempt = 0; canContinue(); attempt++) {
+        try {
+          await decide(actionId, "approve");
+          submitted = true;
+          return;
+        } catch (reason) {
+          if (!canContinue()) return;
+          if (
+            reason instanceof AIRequestError &&
+            reason.status === 409 &&
+            ["run_active", "checkpoint_pending"].includes(reason.code || "") &&
+            attempt < delays.length
+          ) {
+            await new Promise<void>(resolve =>
+              window.setTimeout(resolve, delays[attempt])
+            );
+            continue;
+          }
+          autoApprove.value = false;
+          error.value = `自动批准失败，已关闭自动批准，请查看工具操作：${errorText(reason)}`;
+          return;
+        }
+      }
+    } finally {
+      if (
+        !submitted &&
+        generation === approvalGeneration &&
+        readyRevision === runStatusRevision &&
+        activeRun.value?.id === runId &&
+        ["waiting_approval", "cancelling"].includes(activeRun.value.status)
+      )
+        approvalReady.value = true;
+      if (generation === approvalGeneration) autoApproving.value = false;
+    }
+  }
+
+  function resetForUser() {
+    sessionController?.abort();
+    sessionGeneration++;
+    listGeneration++;
+    submissionGeneration++;
+    summaryGeneration++;
+    summarizingMemory.value = false;
+    sessionCache.clear();
+    draftScopes.clear();
+    titleGenerations.clear();
+    autoTitleOverrides.clear();
+    sessionLoading.value = false;
+    sessionReady.value = true;
+    submitting.value = false;
+    deciding.value = "";
+    cancelling.value = false;
+    autoApproving.value = false;
+    streamController?.abort();
+    streamGeneration++;
+    resetApprovalState();
+    autoApprove.value = false;
+    settledActions.clear();
+    sessions.value = [];
+    messages.value = [];
+    sessionId.value = "";
+    activeRun.value = null;
+    scope.value = emptyScope();
+    skillIds.value = [];
+    selectedMemories.value = [];
+    mcpServers.value = [];
+    provider.value = defaultProvider();
+    lastSeq.value = 0;
+    assistantId = "";
+    initialized.value = false;
+  }
+
+  function saveProvider(value: AIProvider) {
+    if (!owner) throw new Error("尚未获取登录身份，请重试连接服务。");
+    const settings = {
+      base_url: value.base_url.trim().replace(/\/+$/, ""),
+      api_key: value.api_key.trim(),
+      model: value.model.trim(),
+      max_input_tokens: savedNumber(value.max_input_tokens),
+      max_output_tokens: savedNumber(value.max_output_tokens),
+      compression_ratio: savedNumber(value.compression_ratio),
+      reasoning_effort: savedEffort(value.reasoning_effort)
+    };
+    localStorage.setItem(providerStorageKey(owner), JSON.stringify(settings));
+    provider.value = settings;
+  }
+
+  function forgetProvider() {
+    if (owner) localStorage.removeItem(providerStorageKey(owner));
+    provider.value = defaultProvider();
+  }
+
+  async function refreshBootstrap() {
+    const data = await aiApi.bootstrap();
+    if (!data.username)
+      throw new Error("AI 服务未收到登录身份，请检查认证代理配置。");
+    if (owner !== data.username) {
+      resetForUser();
+      owner = data.username;
+      try {
+        const saved = JSON.parse(
+          localStorage.getItem(providerStorageKey(owner)) || "null"
+        );
+        if (
+          saved &&
+          typeof saved.base_url === "string" &&
+          typeof saved.model === "string"
+        ) {
+          provider.value = {
+            base_url: saved.base_url,
+            model: saved.model,
+            api_key: saved.api_key || "",
+            max_input_tokens: savedNumber(saved.max_input_tokens),
+            max_output_tokens: savedNumber(saved.max_output_tokens),
+            compression_ratio: savedNumber(saved.compression_ratio),
+            reasoning_effort: savedEffort(saved.reasoning_effort)
+          };
+        }
+      } catch {
+        error.value = "浏览器中的模型配置无法读取，请重新配置。";
+      }
+    }
+    bootstrap.value = {
+      ...data,
+      clusters: data.clusters || [],
+      skills: data.skills || []
+    };
+    if (
+      !scope.value.env ||
+      !data.clusters.some(item => item.env === scope.value.env)
+    ) {
+      const available = data.clusters.find(
+        item => item.online || item.configured
+      );
+      scope.value = {
+        ...emptyScope(),
+        env: available?.env || data.clusters[0]?.env || ""
+      };
+    }
+  }
+
+  async function refreshSessions() {
+    const generation = ++listGeneration;
+    const username = owner;
+    const result = await aiApi.sessions();
+    if (generation !== listGeneration || username !== owner) return;
+    const remote = (result.sessions || []).map(item => {
+      const override = autoTitleOverrides.get(item.id);
+      if (!override) return item;
+      if (item.title === "新会话") return { ...item, title: override };
+      if (item.title !== "新会话") autoTitleOverrides.delete(item.id);
+      return item;
+    });
+    sessions.value = [...sessions.value.filter(item => item.draft), ...remote];
+    const available = new Set(remote.map(item => item.id));
+    for (const id of sessionCache.keys()) {
+      if (!available.has(id) && id !== sessionId.value) sessionCache.delete(id);
+    }
+    for (const id of autoTitleOverrides.keys()) {
+      if (!available.has(id) && id !== sessionId.value)
+        autoTitleOverrides.delete(id);
+    }
+  }
+
+  async function refreshMcpServers() {
+    const username = owner;
+    const result = await aiApi.mcpServers();
+    if (username === owner) mcpServers.value = result.servers || [];
+  }
+
+  function upsertMcpServer(server: AIMcpServer) {
+    const index = mcpServers.value.findIndex(item => item.id === server.id);
+    if (index >= 0) mcpServers.value.splice(index, 1, server);
+    else mcpServers.value.push(server);
+  }
+
+  function dropMcpServer(id: string) {
+    mcpServers.value = mcpServers.value.filter(item => item.id !== id);
+  }
+
+  async function open(requestedSession?: string) {
+    mounted.value = true;
+    visible.value = true;
+    if (loading.value) return;
+    loading.value = true;
+    error.value = "";
+    try {
+      const previousOwner = owner;
+      const previousSelection = sessionGeneration;
+      await refreshBootstrap();
+      const selection =
+        previousOwner !== owner ? sessionGeneration : previousSelection;
+      if (!bootstrap.value.enabled) return;
+      // 只用来在按钮上显示启用的 MCP 个数；旧版 AI 服务没有这个接口
+      void refreshMcpServers().catch(() => undefined);
+      await refreshSessions();
+      if (selection !== sessionGeneration) {
+        initialized.value = true;
+        return;
+      }
+      if (requestedSession) {
+        if (busy.value && requestedSession !== sessionId.value)
+          throw new Error("当前会话正在执行，请先停止后再打开另一个会话。");
+        if (!busy.value || requestedSession !== sessionId.value) {
+          await selectSession(requestedSession);
+        }
+      } else if (!initialized.value && sessions.value.length) {
+        await selectSession(sessions.value[0].id);
+      } else if (sessionId.value && !busy.value) {
+        // MCP clients can add pending actions while this dialog is closed.
+        await selectSession(sessionId.value);
+      }
+      initialized.value = true;
+    } catch (reason) {
+      error.value = errorText(reason);
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  function recoverActions(run: AIRun) {
+    for (const action of run.pending_actions || []) {
+      if (action.action_id) approvalActionIds.add(String(action.action_id));
+      upsertTool(
+        action,
+        "approval",
+        `${run.id}:${String(action.action_id || newAIId())}`,
+        true
+      );
+    }
+  }
+
+  function normalizedSession(data: AISession): AISession {
+    return {
+      ...data,
+      messages: (data.messages || []).map(message => ({
+        ...message,
+        content:
+          typeof message.content === "string"
+            ? message.content
+            : safeAIText(message.content),
+        tools: (message.tools || []).map(tool =>
+          normalizeAITool(tool, message.scope?.env)
+        ),
+        memories: (message.memories || []).map(memory => ({
+          id: memory.id,
+          title: safeAIText(memory.title),
+          content: safeAIText(memory.content),
+          version: memory.version
+        }))
+      }))
+    };
+  }
+
+  function cacheSession(data: AISession) {
+    sessionCache.delete(data.id);
+    const history = data.messages || [];
+    // Bound both entry count and total history size. A single huge conversation
+    // stays visible but is not retained when the user switches away.
+    if (history.length > 2000) return;
+    const weight = history.reduce(
+      (total, message) =>
+        total +
+        message.content.length +
+        JSON.stringify(message.tools || []).length +
+        JSON.stringify(message.memories || []).length,
+      0
+    );
+    if (weight > 2000000) return;
+    sessionCache.set(data.id, { data, weight });
+    let total = [...sessionCache.values()].reduce(
+      (sum, entry) => sum + entry.weight,
+      0
+    );
+    while (sessionCache.size > 16 || total > 2000000) {
+      const oldest = sessionCache.keys().next().value!;
+      total -= sessionCache.get(oldest)!.weight;
+      sessionCache.delete(oldest);
+    }
+  }
+
+  function showHistory(data: AISession) {
+    messages.value = data.messages || [];
+    contextUsage.value = data.usage ?? null;
+    const lastScope = [...messages.value]
+      .reverse()
+      .find(message => message.scope)?.scope;
+    if (lastScope) scope.value = JSON.parse(JSON.stringify(lastScope));
+  }
+
+  function beginSelection(id: string) {
+    if (sessions.value.find(item => item.id === sessionId.value)?.draft)
+      draftScopes.set(sessionId.value, JSON.parse(JSON.stringify(scope.value)));
+    sessionController?.abort();
+    sessionController = null;
+    sessionGeneration++;
+    summaryGeneration++;
+    summarizingMemory.value = false;
+    streamController?.abort();
+    streamGeneration++;
+    resetApprovalState();
+    sessionId.value = id;
+    selectedMemories.value = [];
+    activeRun.value = null;
+    contextUsage.value = null;
+    assistantId = "";
+    lastSeq.value = 0;
+    streamState.value = "idle";
+    streamError.value = "";
+    error.value = "";
+  }
+
+  async function selectSession(id: string) {
+    if (busy.value && id !== sessionId.value) return;
+    beginSelection(id);
+    const draft = sessions.value.find(item => item.id === id && item.draft);
+    if (draft) {
+      messages.value = [];
+      if (draftScopes.has(id))
+        scope.value = JSON.parse(JSON.stringify(draftScopes.get(id)));
+      sessionReady.value = true;
+      sessionLoading.value = false;
+      return;
+    }
+    const cached = sessionCache.get(id);
+    if (cached) {
+      sessionCache.delete(id);
+      sessionCache.set(id, cached);
+      showHistory(cached.data);
+    } else messages.value = [];
+    sessionReady.value = false;
+    sessionLoading.value = true;
+    const generation = sessionGeneration;
+    const username = owner;
+    const controller = new AbortController();
+    sessionController = controller;
+    try {
+      const response = await aiApi.session(id, controller.signal);
+      if (
+        generation !== sessionGeneration ||
+        username !== owner ||
+        controller.signal.aborted
+      )
+        return;
+      if (response.id !== id)
+        throw new Error("会话返回的标识不匹配，请刷新后重试。");
+      const data = normalizedSession(response);
+      cacheSession(data);
+      showHistory(data);
+      sessionReady.value = true;
+      activeRun.value =
+        typeof data.active_run === "string"
+          ? { id: data.active_run, status: "running" }
+          : data.active_run || null;
+      if (activeRun.value && !isTerminalRun(activeRun.value.status)) {
+        recoveredEventSeq = activeRun.value.event_seq || 0;
+        if (activeRun.value.scope)
+          scope.value = JSON.parse(JSON.stringify(activeRun.value.scope));
+        const lastMessage = messages.value[messages.value.length - 1];
+        if (lastMessage?.role === "assistant") assistantId = lastMessage.id;
+        recoverActions(activeRun.value);
+        approvalReady.value = activeRun.value.status === "waiting_approval";
+        void connectRun(activeRun.value.id);
+      }
+    } catch (reason) {
+      if (
+        generation !== sessionGeneration ||
+        controller.signal.aborted ||
+        username !== owner
+      )
+        return;
+      error.value = errorText(reason);
+      throw reason;
+    } finally {
+      if (generation === sessionGeneration) {
+        sessionLoading.value = false;
+        sessionController = null;
+      }
+    }
+  }
+
+  async function createSession() {
+    if (busy.value) return;
+    const existing = sessions.value.find(item => item.draft);
+    const created: AISession = existing || {
+      id: `draft:${newAIId()}`,
+      title: "新会话",
+      created_at: new Date().toISOString(),
+      draft: true
+    };
+    if (!existing) sessions.value.unshift(created);
+    beginSelection(created.id);
+    draftScopes.set(created.id, JSON.parse(JSON.stringify(scope.value)));
+    messages.value = [];
+    sessionLoading.value = false;
+    sessionReady.value = true;
+    return created;
+  }
+
+  async function renameSession(id: string, title: string) {
+    const session = sessions.value.find(item => item.id === id);
+    const username = owner;
+    titleGenerations.set(id, (titleGenerations.get(id) || 0) + 1);
+    autoTitleOverrides.delete(id);
+    if (!session?.draft) await aiApi.renameSession(id, title.trim());
+    if (username !== owner) return;
+    listGeneration++;
+    if (session) session.title = title.trim();
+    const cached = sessionCache.get(id);
+    if (cached) cached.data.title = title.trim();
+  }
+
+  async function deleteSession(id: string) {
+    if (busy.value) return;
+    const username = owner;
+    if (!sessions.value.find(item => item.id === id)?.draft)
+      await aiApi.deleteSession(id);
+    if (username !== owner) return;
+    listGeneration++;
+    sessionCache.delete(id);
+    draftScopes.delete(id);
+    titleGenerations.delete(id);
+    autoTitleOverrides.delete(id);
+    sessions.value = sessions.value.filter(item => item.id !== id);
+    if (sessionId.value === id) {
+      beginSelection("");
+      sessionReady.value = true;
+      sessionLoading.value = false;
+      messages.value = [];
+      resetApprovalState();
+      activeRun.value = null;
+      if (sessions.value.length) await selectSession(sessions.value[0].id);
+    }
+  }
+
+  function changeScope(value: AIScope) {
+    if (busy.value || !sessionReady.value) return;
+    scope.value = JSON.parse(JSON.stringify(value));
+  }
+
+  function setSelectedMemories(items: AIMemorySummary[]) {
+    if (busy.value || !sessionReady.value)
+      throw new Error("当前会话正在执行或核验状态，请稍后引入记忆。");
+    const unique = [...new Map(items.map(item => [item.id, item])).values()];
+    if (unique.length > 10) throw new Error("每轮最多引入 10 条记忆。");
+    selectedMemories.value = unique.map(item => ({
+      id: item.id,
+      title: item.title,
+      version: item.version,
+      created_by: item.created_by,
+      updated_by: item.updated_by,
+      created_at: item.created_at,
+      updated_at: item.updated_at
+    }));
+  }
+
+  function removeSelectedMemory(id: string) {
+    if (busy.value || !sessionReady.value) return;
+    selectedMemories.value = selectedMemories.value.filter(
+      item => item.id !== id
+    );
+  }
+
+  async function summarizeMemory() {
+    if (busy.value || !sessionReady.value || summarizingMemory.value)
+      throw new Error("请结束当前轮次并完成会话状态核验后再总结。");
+    if (
+      !sessionId.value ||
+      sessions.value.some(item => item.id === sessionId.value && item.draft)
+    )
+      throw new Error("当前会话没有可总结的已完成对话。");
+    if (!configured.value)
+      throw new Error("请先配置模型的 Base URL 和模型名。");
+    const username = owner;
+    const id = sessionId.value;
+    const generation = sessionGeneration;
+    const summary = ++summaryGeneration;
+    summarizingMemory.value = true;
+    try {
+      const draft = await aiApi.summarizeMemory(id, { ...provider.value });
+      if (
+        username !== owner ||
+        id !== sessionId.value ||
+        generation !== sessionGeneration
+      )
+        throw new Error("会话已切换，请在当前会话重新生成记忆草稿。");
+      return draft;
+    } finally {
+      if (summary === summaryGeneration) summarizingMemory.value = false;
+    }
+  }
+
+  async function generateSessionTitle(
+    id: string,
+    message: string,
+    username: string,
+    generation: number,
+    modelProvider: AIProvider
+  ) {
+    try {
+      const result = await aiApi.generateSessionTitle(id, message, {
+        ...modelProvider
+      });
+      if (
+        username !== owner ||
+        generation !== (titleGenerations.get(id) || 0) ||
+        !result.generated
+      )
+        return;
+      autoTitleOverrides.set(id, result.title);
+      const session = sessions.value.find(item => item.id === id);
+      if (session && session.title === "新会话") session.title = result.title;
+      const cached = sessionCache.get(id);
+      if (cached && cached.data.title === "新会话")
+        cached.data.title = result.title;
+    } catch {
+      // Title generation is best effort and must never affect the active run.
+    }
+  }
+
+  function assistantMessage(): AIMessage {
+    let message = messages.value.find(item => item.id === assistantId);
+    if (!message) {
+      assistantId = newAIId();
+      message = {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        scope: activeRun.value?.scope || { ...scope.value },
+        tools: [],
+        created_at: new Date().toISOString()
+      };
+      messages.value.push(message);
+      // Work on Vue's reactive item, not the detached original object.
+      message = messages.value[messages.value.length - 1];
+    }
+    return message;
+  }
+
+  function upsertTool(
+    data: Record<string, any>,
+    type: string,
+    fallbackId: string,
+    replayed = false
+  ) {
+    const tools = assistantMessage().tools!;
+    const actionId = String(data.action_id || data.approval_id || "");
+    const callId = String(data.tool_call_id || data.call_id || data.id || "");
+    const name = String(data.name || data.tool_name || data.tool || "工具调用");
+    let tool = tools.find(
+      item =>
+        (actionId && item.action_id === actionId) ||
+        (callId && (item.tool_call_id === callId || item.id === callId))
+    );
+    if (!tool && type !== "tool_start") {
+      tool = [...tools]
+        .reverse()
+        .find(
+          item =>
+            item.name === name &&
+            (!actionId || !item.action_id) &&
+            ["running", "pending", "waiting_approval"].includes(item.status)
+        );
+    }
+    if (!tool) {
+      tools.push({
+        id: actionId || callId || fallbackId,
+        name,
+        status: "running"
+      });
+      tool = tools[tools.length - 1];
+    }
+    const result = data.result ?? data.output;
+    const meta = result && typeof result === "object" ? result : {};
+    Object.assign(tool, {
+      name,
+      ...(actionId ? { action_id: actionId } : {}),
+      ...(callId ? { tool_call_id: callId } : {}),
+      env:
+        data.env ||
+        data.cluster ||
+        data.scope?.env ||
+        tool.env ||
+        activeRun.value?.scope?.env,
+      namespace: data.namespace || data.scope?.namespace || tool.namespace,
+      source: data.source || data.connector || meta.source || tool.source,
+      observed_at:
+        data.observed_at ||
+        data.timestamp ||
+        meta.observed_at ||
+        meta.collected_at ||
+        tool.observed_at,
+      freshness: data.freshness || meta.freshness || tool.freshness,
+      truncated: data.truncated ?? meta.truncated ?? tool.truncated,
+      arguments: data.arguments ?? data.args ?? tool.arguments,
+      command: data.command ?? tool.command,
+      diff: data.diff ?? tool.diff,
+      preview: data.preview ?? tool.preview
+    });
+    if (type === "tool_start") {
+      if (actionId) settledActions.add(`${activeRun.value?.id}:${actionId}`);
+      tool.pending = false;
+      tool.status = "running";
+    } else if (type === "approval") {
+      if (settledActions.has(`${activeRun.value?.id}:${actionId}`)) return;
+      if (replayed && !approvalActionIds.has(actionId)) return;
+      if (actionId) approvalActionIds.add(actionId);
+      tool.pending = true;
+      tool.status = "waiting_approval";
+      if (activeRun.value && !replayed)
+        activeRun.value.status = "waiting_approval";
+    } else if (type === "tool_result") {
+      if (actionId) settledActions.add(`${activeRun.value?.id}:${actionId}`);
+      tool.pending = false;
+      tool.result = result ?? data;
+      tool.error =
+        typeof (data.error || meta.error) === "string"
+          ? data.error || meta.error
+          : (data.error || meta.error)?.message;
+      tool.status =
+        data.status ||
+        (meta.error?.code === "outcome_unknown"
+          ? "unknown"
+          : data.error || meta.error || meta.success === false
+            ? "failed"
+            : "completed");
+    }
+  }
+
+  function handleEvent(event: AIEvent) {
+    if (event.seq && event.seq <= lastSeq.value) return;
+    if (event.seq) lastSeq.value = event.seq;
+    const replayed = event.seq > 0 && event.seq <= recoveredEventSeq;
+    const data: Record<string, any> =
+      typeof event.data === "string"
+        ? { content: event.data }
+        : event.data || {};
+    if (event.type === "token") {
+      assistantMessage().content += String(
+        data.token ?? data.text ?? data.content ?? ""
+      );
+    } else if (event.type === "message") {
+      if (data.content !== undefined)
+        assistantMessage().content = safeAIText(data.content);
+    } else if (event.type === "tool_start" || event.type === "tool_result") {
+      upsertTool(data, event.type, `${activeRun.value?.id}:${event.seq}`);
+    } else if (event.type === "approval") {
+      for (const action of data.actions || data.pending_actions || [data]) {
+        upsertTool(
+          action,
+          "approval",
+          `${activeRun.value?.id}:${event.seq}`,
+          replayed
+        );
+      }
+    } else if (event.type === "status") {
+      // Rebuild streamed content after session recovery without reusing the
+      // snapshot's old waiting status to resume the graph a second time.
+      if (replayed) return;
+      runStatusRevision++;
+      if (activeRun.value)
+        activeRun.value.status = String(
+          data.status || data.state || data.content || "running"
+        );
+      approvalReady.value = activeRun.value?.status === "waiting_approval";
+      if (data.error) error.value = String(data.error);
+    } else if (event.type === "error") {
+      if (replayed) return;
+      runStatusRevision++;
+      approvalReady.value = false;
+      error.value = String(
+        data.message || data.error || data.content || "本轮执行失败。"
+      );
+      if (activeRun.value) activeRun.value.status = "failed";
+    } else if (event.type === "done") {
+      // 每轮结束带上这一轮的用量：最近一次输入 ÷ 模型窗口就是当前上下文占用
+      if (data.usage && typeof data.usage === "object")
+        contextUsage.value = data.usage as AIUsage;
+      if (replayed) return;
+      runStatusRevision++;
+      approvalReady.value = false;
+      if (activeRun.value)
+        activeRun.value.status = String(data.status || "completed");
+    }
+  }
+
+  async function connectRun(runId: string) {
+    streamController?.abort();
+    const generation = ++streamGeneration;
+    const controller = new AbortController();
+    streamController = controller;
+    let attempts = 0;
+    while (generation === streamGeneration && !controller.signal.aborted) {
+      if (
+        !activeRun.value ||
+        activeRun.value.id !== runId ||
+        isTerminalRun(activeRun.value.status)
+      )
+        break;
+      streamState.value = attempts ? "reconnecting" : "connecting";
+      try {
+        await streamAIEvents(runId, lastSeq.value, controller.signal, event => {
+          if (generation !== streamGeneration) return;
+          streamState.value = "connected";
+          streamError.value = "";
+          attempts = 0;
+          handleEvent(event);
+          if (activeRun.value && isTerminalRun(activeRun.value.status))
+            controller.abort();
+        });
+      } catch (reason) {
+        if (controller.signal.aborted || generation !== streamGeneration) break;
+        if (
+          reason instanceof AIRequestError &&
+          [401, 403, 404, 410].includes(reason.status)
+        ) {
+          streamError.value = `${errorText(reason)}；请刷新会话状态。`;
+          streamState.value = "disconnected";
+          break;
+        }
+        streamError.value =
+          "流连接已断开，正在恢复进度。已提交的操作不会重复发送。";
+      }
+      if (activeRun.value && isTerminalRun(activeRun.value.status)) break;
+      attempts++;
+      await new Promise<void>(resolve => {
+        const timer = window.setTimeout(
+          resolve,
+          Math.min(1000 * 2 ** Math.min(attempts, 4), 20000)
+        );
+        controller.signal.addEventListener(
+          "abort",
+          () => {
+            window.clearTimeout(timer);
+            resolve();
+          },
+          { once: true }
+        );
+      });
+    }
+    if (generation !== streamGeneration) return;
+    if (activeRun.value && isTerminalRun(activeRun.value.status)) {
+      streamState.value = "idle";
+      for (const tool of pendingTools.value) {
+        tool.pending = false;
+        tool.status =
+          activeRun.value.status === "completed"
+            ? "completed"
+            : activeRun.value.status;
+      }
+      try {
+        const currentSession = sessionId.value;
+        const username = owner;
+        const data = await aiApi.session(currentSession);
+        if (
+          generation !== streamGeneration ||
+          username !== owner ||
+          currentSession !== sessionId.value
+        )
+          return;
+        if (
+          data.messages?.length &&
+          data.messages[data.messages.length - 1].role === "assistant"
+        ) {
+          const normalized = normalizedSession(data);
+          messages.value = normalized.messages || [];
+          cacheSession(normalized);
+        }
+        await refreshSessions();
+      } catch {
+        if (generation !== streamGeneration) return;
+        streamError.value =
+          "执行已结束，但历史同步失败；当前结果保留，可稍后刷新。";
+      }
+    }
+  }
+
+  /**
+   * replaceLast：重新生成 / 编辑后重发，服务端替换最后一轮；
+   * scope / memoryIds 不传时用当前选择（重新生成时沿用原来那一轮的）
+   */
+  async function send(
+    message: string,
+    options: {
+      replaceLast?: boolean;
+      scope?: AIScope;
+      memoryIds?: string[];
+    } = {}
+  ) {
+    if (busy.value || !message.trim()) return;
+    if (!sessionReady.value)
+      throw new Error("正在核验会话状态，请稍后发送；可以继续输入或切换会话。");
+    if (!configured.value)
+      throw new Error("请先配置模型的 Base URL 和模型名。");
+    const target = options.scope ?? scope.value;
+    if (
+      !target.env ||
+      !bootstrap.value?.clusters.some(cluster => cluster.env === target.env)
+    )
+      throw new Error("请选择已登记的 K8S 集群。");
+    error.value = "";
+    streamError.value = "";
+    const firstUserMessage = !messages.value.some(
+      messageItem => messageItem.role === "user"
+    );
+    const memoryIds =
+      options.memoryIds ?? selectedMemories.value.map(item => item.id);
+    if (!sessionId.value) {
+      // Automatic first-send drafts keep the pending references. Explicit new
+      // chats and session switches still clear them in beginSelection.
+      const pendingMemories = selectedMemories.value;
+      void createSession();
+      selectedMemories.value = pendingMemories;
+    }
+    submitting.value = true;
+    const submission = ++submissionGeneration;
+    const snapshot: AIScope = JSON.parse(JSON.stringify(target));
+    const username = owner;
+    try {
+      const draft = sessions.value.find(
+        item => item.id === sessionId.value && item.draft
+      );
+      if (draft) {
+        const created = await aiApi.createSession(
+          draft.id.slice(6),
+          draft.title
+        );
+        if (username !== owner) return;
+        listGeneration++;
+        const index = sessions.value.findIndex(item => item.id === draft.id);
+        if (index >= 0) sessions.value.splice(index, 1, created);
+        else sessions.value.unshift(created);
+        draftScopes.delete(draft.id);
+        sessionId.value = created.id;
+      }
+      const currentSession = sessionId.value;
+      sessionCache.delete(currentSession);
+      const run = await aiApi.run(
+        currentSession,
+        {
+          message: message.trim(),
+          scope: snapshot,
+          provider: { ...provider.value },
+          skill_ids: [...skillIds.value],
+          memory_ids: memoryIds,
+          ...(options.replaceLast ? { replace_last: true } : {})
+        },
+        newAIId()
+      );
+      if (
+        username !== owner ||
+        currentSession !== sessionId.value ||
+        submission !== submissionGeneration
+      )
+        return;
+      if (!options.memoryIds) selectedMemories.value = [];
+      if (options.replaceLast) {
+        // 服务端已把最后一轮标成被替换：界面上同样去掉，从那一轮的用户消息起
+        const index = messages.value.map(item => item.role).lastIndexOf("user");
+        if (index >= 0) messages.value.splice(index);
+      }
+      const userMessage = run.message || {
+        id: newAIId(),
+        role: "user",
+        content: message.trim(),
+        scope: snapshot,
+        created_at: new Date().toISOString()
+      };
+      messages.value.push(
+        normalizedSession({
+          id: currentSession,
+          title: "",
+          messages: [userMessage]
+        }).messages![0]
+      );
+      resetApprovalState();
+      activeRun.value = { id: run.run_id, status: run.status, scope: snapshot };
+      assistantId = "";
+      lastSeq.value = 0;
+      assistantMessage();
+      void connectRun(run.run_id);
+      void refreshSessions().catch(() => undefined);
+      if (firstUserMessage) {
+        // This request is intentionally detached from the conversation stream.
+        // A slow or failed title model call cannot delay or fail the run.
+        void generateSessionTitle(
+          currentSession,
+          message.trim(),
+          username,
+          titleGenerations.get(currentSession) || 0,
+          { ...provider.value }
+        );
+      }
+    } catch (reason) {
+      if (username !== owner) return;
+      error.value = errorText(reason);
+      throw reason;
+    } finally {
+      if (submission === submissionGeneration) submitting.value = false;
+    }
+  }
+
+  /** 重新生成最后一轮：沿用那一轮的问题、集群范围和引用的记忆 */
+  async function regenerate() {
+    const last = [...messages.value]
+      .reverse()
+      .find(item => item.role === "user");
+    if (!last) return;
+    await send(last.content, {
+      replaceLast: true,
+      scope: last.scope?.env ? last.scope : scope.value,
+      memoryIds: (last.memories || []).map(item => item.id).filter(Boolean)
+    });
+  }
+
+  /**
+   * 页面上的「问 AI」：打开对话框，新开一个会话并选好资源范围，问题放进输入框，
+   * 由用户确认后再发送（不自动消耗模型调用）
+   */
+  async function ask(request: { scope: Partial<AIScope>; prompt: string }) {
+    await open();
+    if (!bootstrap.value?.enabled) return;
+    if (!busy.value) {
+      await createSession();
+      const env = request.scope.env;
+      if (env && bootstrap.value.clusters.some(cluster => cluster.env === env))
+        changeScope({ ...emptyScope(), ...request.scope });
+    }
+    pendingInput.value = request.prompt;
+  }
+
+  async function decide(actionId: string, decision: "approve" | "reject") {
+    if (!sessionReady.value)
+      throw new Error("正在核验会话状态，暂不能批准或拒绝缓存中的操作。");
+    if (!activeRun.value || deciding.value) return;
+    // 不在这里看集群权限:服务端批准时按动作涉及的操作复核(审批期间被降权会被拒绝),
+    // 用户自己接入的 MCP 和集群权限无关
+    const runId = activeRun.value.id;
+    const generation = approvalGeneration;
+    const revision = runStatusRevision;
+    const wasReady = approvalReady.value;
+    approvalReady.value = false;
+    deciding.value = actionId;
+    error.value = "";
+    try {
+      await aiApi.decision(runId, actionId, decision, {
+        ...provider.value
+      });
+      if (generation !== approvalGeneration || activeRun.value?.id !== runId)
+        return;
+      settledActions.add(`${runId}:${actionId}`);
+      const tool = pendingTools.value.find(item => item.action_id === actionId);
+      if (tool) {
+        tool.pending = false;
+        tool.status = decision === "approve" ? "running" : "rejected";
+      }
+      if (
+        revision === runStatusRevision &&
+        !isTerminalRun(activeRun.value.status)
+      )
+        activeRun.value.status = "running";
+      if (streamState.value === "disconnected")
+        void connectRun(activeRun.value.id);
+    } catch (reason) {
+      if (generation === approvalGeneration) {
+        error.value = errorText(reason);
+        if (
+          revision === runStatusRevision &&
+          activeRun.value?.id === runId &&
+          activeRun.value.status === "waiting_approval"
+        )
+          approvalReady.value = wasReady;
+      }
+      throw reason;
+    } finally {
+      if (generation === approvalGeneration) deciding.value = "";
+    }
+  }
+
+  async function cancel() {
+    if (
+      !activeRun.value ||
+      cancelling.value ||
+      isTerminalRun(activeRun.value.status)
+    )
+      return;
+    cancelling.value = true;
+    const generation = approvalGeneration;
+    const runId = activeRun.value.id;
+    const previous = activeRun.value.status;
+    activeRun.value.status = "cancelling";
+    try {
+      const result = await aiApi.cancel(runId);
+      if (generation !== approvalGeneration || activeRun.value?.id !== runId)
+        return;
+      activeRun.value.status = result.status || "cancelled";
+      if (isTerminalRun(activeRun.value.status)) {
+        for (const tool of pendingTools.value) {
+          tool.pending = false;
+          tool.status = "cancelled";
+        }
+        // Keep the subscription until cancellation/results are drained, then
+        // the server's terminal event triggers the history synchronization.
+      }
+    } catch (reason) {
+      if (generation !== approvalGeneration || activeRun.value?.id !== runId)
+        return;
+      activeRun.value.status = previous;
+      error.value = errorText(reason);
+      throw reason;
+    } finally {
+      if (generation === approvalGeneration) cancelling.value = false;
+    }
+  }
+
+  return {
+    visible,
+    mounted,
+    loading,
+    initialized,
+    bootstrap,
+    provider,
+    sessions,
+    sessionId,
+    sessionLoading,
+    sessionReady,
+    messages,
+    scope,
+    skillIds,
+    selectedMemories,
+    summarizingMemory,
+    activeRun,
+    contextUsage,
+    submitting,
+    deciding,
+    cancelling,
+    error,
+    streamError,
+    streamState,
+    lastSeq,
+    readOnly,
+    globalWritable,
+    clusterPermission,
+    autoApprove,
+    configured,
+    busy,
+    selectedCluster,
+    clusterAvailable,
+    liveAvailable,
+    pendingTools,
+    mcpServers,
+    enabledMcpCount,
+    open,
+    refreshBootstrap,
+    refreshSessions,
+    refreshMcpServers,
+    upsertMcpServer,
+    dropMcpServer,
+    saveProvider,
+    forgetProvider,
+    selectSession,
+    createSession,
+    renameSession,
+    deleteSession,
+    changeScope,
+    setSelectedMemories,
+    removeSelectedMemory,
+    summarizeMemory,
+    send,
+    regenerate,
+    ask,
+    pendingInput,
+    decide,
+    cancel
+  };
+});
+
+export function useAIStoreHook() {
+  return useAIStore(store);
+}

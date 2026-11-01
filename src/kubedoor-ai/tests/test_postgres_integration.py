@@ -1,0 +1,769 @@
+"""Opt-in integration against an isolated localhost PostgreSQL database.
+
+Set AI_TEST_PG_DATABASE (a name beginning kubedoor_ai_test), AI_TEST_PG_PORT,
+AI_TEST_PG_USER and AI_TEST_PG_PASSWORD. No production services are contacted.
+"""
+
+import asyncio
+import json
+import os
+import socket
+import sys
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from urllib.parse import urlsplit
+
+import httpx
+import pytest
+import uvicorn
+from fastmcp import Client
+from fastmcp.client.transports import SSETransport, StreamableHttpTransport
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+from kubedoor_ai.domain import Identity, Provider
+from kubedoor_ai.gateway import RunContext
+from kubedoor_ai.http import create_app
+from kubedoor_ai.runtime import text_content
+from kubedoor_ai.service import Service
+from fakes import ScriptedModel, control_state, remote_mcp
+
+
+pytestmark = pytest.mark.skipif(not os.getenv("AI_TEST_PG_DATABASE"), reason="isolated PostgreSQL integration is opt-in")
+TOKEN = "local-integration-token"
+MODEL_KEY = "local-provider-private-key"
+PROVIDER = {"base_url": "http://model.invalid/v1", "api_key": MODEL_KEY, "model": "local-test-model"}
+
+
+class Harness:
+    async def start(self):
+        self.username = "integration-" + uuid.uuid4().hex
+        self.headers = {"X-Kubedoor-Token": TOKEN, "X-User-Name": self.username, "X-User-Permission": "rw"}
+        self.upstream = []
+        self.service = await Service.open("http://master.invalid", TOKEN, "ab" * 32)
+        await self.service.gateway.http.aclose()
+        self.service.gateway.http = httpx.AsyncClient(transport=httpx.MockTransport(self.master))
+        self.app = create_app(self.service, TOKEN)
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        self.server = uvicorn.Server(uvicorn.Config(self.app, access_log=False, log_level="error", lifespan="on"))
+        self.server_task = asyncio.create_task(self.server.serve(sockets=[self.sock]))
+        for _ in range(200):
+            if self.server.started:
+                break
+            if self.server_task.done():
+                await self.server_task
+                raise AssertionError("test server failed to start")
+            await asyncio.sleep(0.025)
+        assert self.server.started
+        self.http = httpx.AsyncClient(base_url=self.url, headers=self.headers, timeout=15, trust_env=False)
+        return self
+
+    def master(self, request):
+        assert request.headers["X-Kubedoor-Token"] == TOKEN
+        self.upstream.append((request.method, request.url.path, dict(request.url.params), json.loads(request.content) if request.content else None))
+        if request.url.path == "/api/ai/internal/bootstrap":
+            return httpx.Response(200, json={"clusters": [{"env": "cluster-a", "online": True}, {"env": "cluster-b", "online": True}]})
+        if request.url.path == "/api/db/res/list":
+            return httpx.Response(200, json={"meta": [{"name": "deployment"}, {"name": "xmx"}], "data": [["app", "512m"]]})
+        if request.url.path == "/api/scale":
+            return httpx.Response(200, json={"success": True, "data": {"replicas": 3}})
+        if request.url.path == "/api/ai/internal/deployment-control":
+            return httpx.Response(200, json={"success": True, "data": control_state()})
+        return httpx.Response(200, json={"success": True, "data": []})
+
+    def model(self, *responses):
+        scripted = ScriptedModel(responses=list(responses))
+        self.service.runtime.model_factory = lambda _: scripted
+
+    async def restart_service(self):
+        await self.service.close()
+        self.service = await Service.open("http://master.invalid", TOKEN, "ab" * 32)
+        await self.service.gateway.http.aclose()
+        self.service.gateway.http = httpx.AsyncClient(transport=httpx.MockTransport(self.master))
+        self.app.state.service = self.service
+
+    async def session(self):
+        response = await self.http.post("/api/ai/sessions", json={"title": "集成测试"})
+        assert response.status_code == 200, response.text
+        return response.json()["id"]
+
+    async def wait(self, rid, status="completed"):
+        for _ in range(400):
+            run = await self.service.store.run(rid, Identity(self.username, "rw"))
+            if run["status"] == status and rid not in self.service.runtime.tasks:
+                return run
+            if run["status"] == "failed" and status != "failed":
+                raise AssertionError(run["error"])
+            await asyncio.sleep(0.025)
+        raise AssertionError(f"run did not reach {status}: {run}")
+
+    async def close(self):
+        self.server.should_exit = True
+        await asyncio.wait_for(self.server_task, 10)
+        await self.http.aclose()
+        sessions = await self.service.store.fetch("SELECT id FROM kubedoor_ai_sessions WHERE username=$1", self.username)
+        for row in sessions:
+            await self.service.runtime.checkpointer.adelete_thread(row["id"])
+        await self.service.store.execute("DELETE FROM kubedoor_ai_sessions WHERE username=$1", self.username)
+        await self.service.store.execute("DELETE FROM kubedoor_ai_connections WHERE updated_by=$1", self.username)
+        await self.service.store.execute("DELETE FROM kubedoor_ai_mcp_servers WHERE username=$1", self.username)
+        await self.service.close()
+
+
+@pytest.fixture
+def harness(monkeypatch):
+    database = os.environ["AI_TEST_PG_DATABASE"]
+    assert database.startswith("kubedoor_ai_test"), "use an isolated test database"
+    for key, default in (("HOST", "127.0.0.1"), ("PORT", "5432"), ("USER", "postgres"), ("PASSWORD", ""), ("DATABASE", database)):
+        monkeypatch.setenv("PG_" + key, os.getenv("AI_TEST_PG_" + key, default))
+    assert os.environ["PG_HOST"] in ("127.0.0.1", "localhost", "::1")
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    runner = asyncio.Runner(loop_factory=asyncio.SelectorEventLoop if sys.platform == "win32" else None)
+    instance = runner.run(Harness().start())
+    try:
+        yield instance, runner
+    finally:
+        runner.run(instance.close())
+        runner.close()
+
+
+def tool_message(operation, arguments):
+    return AIMessage(content="准备调用", tool_calls=[{"name": "kubedoor_tool", "args": {"operation": operation, "arguments": arguments, "source": "kubedoor"}, "id": "provider-reuses-id", "type": "tool_call"}])
+
+
+def test_persisted_multi_turn_sse_cluster_changes_and_secret_redaction(harness):
+    h, runner = harness
+
+    async def verify():
+        async with httpx.AsyncClient(trust_env=False) as anonymous:
+            assert (await anonymous.get(h.url + "/health")).status_code == 200
+        assert (await h.http.get("/api/ai/bootstrap", headers={"X-Kubedoor-Token": "wrong"})).status_code == 401
+        bootstrap = (await h.http.get("/api/ai/bootstrap")).json()
+        assert len(bootstrap["clusters"]) == 2
+        sid = await h.session()
+        h.model(tool_message("resource_inventory", {"namespace": "other-ns"}), AIMessage(content="完成 " + MODEL_KEY),
+                tool_message("resource_inventory", {"namespace": "other-ns"}), AIMessage(content="第二轮完成"))
+        run_ids = []
+        for env in ("cluster-a", "cluster-b"):
+            response = await h.http.post(f"/api/ai/sessions/{sid}/runs", json={"message": "查询 " + MODEL_KEY, "scope": {"env": env, "namespace": "selected-ns"}, "provider": PROVIDER})
+            assert response.status_code == 200, response.text
+            rid = response.json()["run_id"]
+            run_ids.append(rid)
+            await h.wait(rid)
+        detail = (await h.http.get(f"/api/ai/sessions/{sid}")).json()
+        assert len(detail["messages"]) == 4
+        assert [m["scope"]["env"] for m in detail["messages"]] == ["cluster-a", "cluster-a", "cluster-b", "cluster-b"]
+        assert MODEL_KEY not in json.dumps(detail)
+        assert [call[2]["env"] for call in h.upstream if call[1] == "/api/db/res/list"] == ["cluster-a", "cluster-b"]
+        checkpoint = await h.service.runtime.checkpointer.aget_tuple({"configurable": {"thread_id": sid}})
+        assert MODEL_KEY not in str(checkpoint)
+        events = await h.http.get(f"/api/ai/runs/{run_ids[0]}/events?after=1")
+        rows = [json.loads(line[6:]) for line in events.text.splitlines() if line.startswith("data: ")]
+        assert rows and min(row["seq"] for row in rows) > 1
+        assert rows[-1]["type"] == "done"
+        assert MODEL_KEY not in events.text
+        outsider = {**h.headers, "X-User-Name": "other-user"}
+        assert (await h.http.get(f"/api/ai/sessions/{sid}", headers=outsider)).status_code == 404
+        assert (await h.http.get(f"/api/ai/runs/{run_ids[0]}/events", headers=outsider)).status_code == 404
+
+    runner.run(verify())
+
+
+def test_postgres_interrupt_exact_approval_and_mcp_transports(harness):
+    h, runner = harness
+
+    async def verify():
+        sid = await h.session()
+        h.model(tool_message("scale_deployment", {"namespace": "other-ns", "deployment": "app", "replicas": 3}), AIMessage(content="修改完成"))
+        started = await h.http.post(f"/api/ai/sessions/{sid}/runs", json={"message": "扩容", "scope": {"env": "cluster-a", "namespace": "selected-ns"}, "provider": PROVIDER})
+        assert started.status_code == 200, started.text
+        rid = started.json()["run_id"]
+        await h.wait(rid, "waiting_approval")
+        assert not any(call[1] == "/api/scale" for call in h.upstream)
+        pending = (await h.http.get(f"/api/ai/sessions/{sid}")).json()["active_run"]["pending_actions"][0]
+        other = {**h.headers, "X-User-Name": "other-user"}
+        data = {"action_id": pending["action_id"], "decision": "approve", "provider": PROVIDER}
+        assert (await h.http.post(f"/api/ai/runs/{rid}/decisions", json=data, headers=other)).status_code == 404
+        approved = await h.http.post(f"/api/ai/runs/{rid}/decisions", json={**data, "arguments": {"replicas": 99}})
+        assert approved.status_code == 200, approved.text
+        await h.wait(rid)
+        writes = [call for call in h.upstream if call[1] == "/api/scale"]
+        assert len(writes) == 1 and writes[0][3] == [{"namespace": "other-ns", "deployment_name": "app", "num": 3}]
+        assert (await h.http.post(f"/api/ai/runs/{rid}/decisions", json=data)).status_code == 200
+        assert len([call for call in h.upstream if call[1] == "/api/scale"]) == 1
+        for transport in (StreamableHttpTransport(h.url + "/mcp", headers=h.headers), SSETransport(h.url + "/sse", headers=h.headers)):
+            async with Client(transport) as client:
+                tools = await client.list_tools()
+                assert len(tools) == 17
+                result = await client.call_tool("get_k8s_list", {})
+                assert not result.is_error
+                resources = await client.list_resources()
+                assert any(str(r.uri) == "skills://kubedoor-k8s" for r in resources)
+        async with Client(StreamableHttpTransport(h.url + "/mcp", headers=h.headers)) as client:
+            pending_result = await client.call_tool("scale_deployment", {"namespace": "team", "deployment": "mcp-app", "replicas": 2, "k8s": "cluster-a"})
+            value = pending_result.data
+            assert value["pending"] and "/#/monit/overview?ai_session=" in value["browserlink"]
+            reject = await h.http.post(f"/api/ai/runs/{value['run_id']}/decisions", json={"action_id": value["action_id"], "decision": "reject"})
+            assert reject.status_code == 200, reject.text
+            assert len([call for call in h.upstream if call[1] == "/api/scale"]) == 1
+
+    runner.run(verify())
+
+
+def test_encrypted_kubeconfig_upload_test_resources_and_failed_replace(harness):
+    h, runner = harness
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def reply(self, value):
+            data = json.dumps(value).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = urlsplit(self.path).path
+            calls.append(("GET", path))
+            if path == "/version":
+                self.reply({"gitVersion": "v1.34.0"})
+            elif path == "/api/v1/namespaces":
+                self.reply({"items": [{"metadata": {"name": "team"}}]})
+            else:
+                self.reply({"items": [], "groups": [], "versions": ["v1"]})
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            calls.append(("POST", self.path))
+            if body.get("kind") == "SelfSubjectReview":
+                self.reply({"status": {"userInfo": {"username": "test-operator"}}})
+            else:
+                self.reply({"status": {"allowed": True}})
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    config = {"apiVersion": "v1", "kind": "Config", "current-context": "test", "contexts": [{"name": "test", "context": {"cluster": "test", "user": "test"}}],
+              "clusters": [{"name": "test", "cluster": {"server": f"http://127.0.0.1:{server.server_port}"}}],
+              "users": [{"name": "test", "user": {"token": "isolated-kube-token"}}]}
+
+    async def verify():
+        candidate = {"content": json.dumps(config), "context": "test"}
+        reader = {**h.headers, "X-User-Permission": "read"}
+        admin = {**h.headers, "X-User-Permission": "admin"}
+        assert (await h.http.post("/api/ai/connections/parse", json=candidate, headers=reader)).status_code == 403
+        # kubeconfig 直连属于集群接入配置,读写用户也不能改,只有管理员可以
+        assert (await h.http.post("/api/ai/connections/parse", json=candidate)).status_code == 403
+        parsed = await h.http.post("/api/ai/connections/parse", json=candidate, headers=admin)
+        assert parsed.status_code == 200 and parsed.json()["current_context"] == "test"
+        tested = await h.http.post("/api/ai/connections/cluster-a/test", json=candidate, headers=admin)
+        assert tested.status_code == 200, tested.text
+        assert tested.json()["data"]["identity_status"] == "verified"
+        saved = await h.http.put("/api/ai/connections/cluster-a", json=candidate, headers=admin)
+        assert saved.status_code == 200, saved.text
+        row = await h.service.store.connection("cluster-a")
+        assert b"isolated-kube-token" not in row["encrypted_config"]
+        encrypted = h.service.gateway.cipher.decrypt("cluster-a", bytes(row["encrypted_config"]))
+        assert encrypted["users"][0]["user"]["token"] == "isolated-kube-token"
+        listing = await h.http.get("/api/ai/connections")
+        assert "isolated-kube-token" not in listing.text and "encrypted_config" not in listing.text
+        failed = await h.http.put("/api/ai/connections/cluster-a", json={"content": "invalid", "context": "test"}, headers=admin)
+        assert failed.status_code == 400
+        assert (await h.service.store.connection("cluster-a"))["revision"] == row["revision"]
+        context = RunContext({"scope": {"env": "cluster-a"}}, Identity(h.username, "rw"))
+        try:
+            direct = await h.service.gateway.execute_action(context, {"source": "direct", "operation": "api", "arguments": {"method": "GET", "path": "/api/v1/namespaces", "query": {"limit": "500"}}, "call_id": "selector-check", "read_only": True})
+            assert direct["success"] and isinstance(direct["data"], dict), direct
+        finally:
+            await h.service.gateway.close_context(context)
+        namespaces = await h.http.get("/api/ai/resources", params={"env": "cluster-a", "kind": "namespaces"})
+        assert namespaces.status_code == 200, namespaces.text
+        assert namespaces.json()["items"] == [{"name": "team"}]
+        assert namespaces.json()["source"] == "direct"
+        assert (await h.http.delete("/api/ai/connections/cluster-a", headers=reader)).status_code == 403
+        assert (await h.http.delete("/api/ai/connections/cluster-a", headers=admin)).status_code == 200
+        assert await h.service.store.connection("cluster-a") is None
+
+    try:
+        runner.run(verify())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_pending_approval_survives_restart_and_cancelled_tools_do_not_revive(harness):
+    h, runner = harness
+
+    async def start_write(sid):
+        h.model(tool_message("scale_deployment", {"namespace": "team", "deployment": "app", "replicas": 3}), AIMessage(content="写入完成"))
+        response = await h.http.post(f"/api/ai/sessions/{sid}/runs", json={"message": "扩容", "scope": {"env": "cluster-a"}, "provider": PROVIDER})
+        assert response.status_code == 200, response.text
+        rid = response.json()["run_id"]
+        await h.wait(rid, "waiting_approval")
+        return rid
+
+    async def verify():
+        sid = await h.session()
+        rid = await start_write(sid)
+        action = (await h.service.store.pending(rid))[0]
+        await h.restart_service()
+        h.model(AIMessage(content="重启后恢复完成"))
+        detail = (await h.http.get(f"/api/ai/sessions/{sid}")).json()
+        assert detail["active_run"]["status"] == "waiting_approval"
+        assert detail["active_run"]["pending_actions"][0]["action_id"] == action["action_id"]
+        approved = await h.http.post(f"/api/ai/runs/{rid}/decisions", json={"action_id": action["action_id"], "decision": "approve", "provider": PROVIDER})
+        assert approved.status_code == 200, approved.text
+        await h.wait(rid)
+        assert len([call for call in h.upstream if call[1] == "/api/scale"]) == 1
+        cancelled_rid = await start_write(sid)
+        cancelled = await h.http.post(f"/api/ai/runs/{cancelled_rid}/cancel")
+        assert cancelled.status_code == 200, cancelled.text
+        await h.wait(cancelled_rid, "cancelled")
+        h.model(tool_message("resource_inventory", {}), AIMessage(content="新一轮只查询"))
+        new_round = await h.http.post(f"/api/ai/sessions/{sid}/runs", json={"message": "改为查询另一个集群", "scope": {"env": "cluster-b"}, "provider": PROVIDER})
+        assert new_round.status_code == 200, new_round.text
+        await h.wait(new_round.json()["run_id"])
+        assert len([call for call in h.upstream if call[1] == "/api/scale"]) == 1
+        assert [call for call in h.upstream if call[1] == "/api/db/res/list"][-1][2]["env"] == "cluster-b"
+        actions = await h.service.store.fetch("SELECT operation FROM kubedoor_ai_actions WHERE run_id=$1::uuid", new_round.json()["run_id"])
+        assert [row["operation"] for row in actions] == ["resource_inventory"]
+
+    runner.run(verify())
+
+
+def test_crash_recovery_keeps_dispatched_writes_unknown(harness):
+    h, runner = harness
+
+    async def verify():
+        identity = Identity(h.username, "rw")
+        session = await h.service.new_session(identity, "模拟未确认结果的写请求")
+        run, _ = await h.service.new_run(identity, session["id"], {"env": "cluster-a"}, origin="mcp")
+        action_id = str(uuid.uuid4())
+        await h.service.store.execute("INSERT INTO kubedoor_ai_actions(id,run_id,call_id,operation,source,arguments,preview,read_only,state) VALUES($1::uuid,$2::uuid,$3,'scale_deployment','kubedoor',$4,$5,false,'dispatching')", action_id, run["id"], run["id"] + ":dispatched", {"namespace": "team", "deployment": "app", "replicas": 3}, {})
+        await h.restart_service()
+        recovered = await h.service.store.run(run["id"], identity)
+        assert recovered["status"] == "failed"
+        action = await h.service.store.one("SELECT state,result FROM kubedoor_ai_actions WHERE id=$1::uuid", action_id)
+        assert action["state"] == "unknown"
+        assert action["result"]["error"]["code"] == "outcome_unknown"
+        response = await h.http.post(f"/api/ai/runs/{run['id']}/decisions", json={"action_id": action_id, "decision": "approve"})
+        assert response.status_code == 200 and response.json()["action_status"] == "unknown"
+        assert not any(call[1] == "/api/scale" for call in h.upstream)
+        replay = await h.http.get(f"/api/ai/runs/{run['id']}/events")
+        assert '"runtime_restarted"' in replay.text and '"done"' in replay.text
+
+    runner.run(verify())
+
+
+def test_wecom_conversation_boundaries_use_one_locked_transaction(harness):
+    """企微会话边界的 SQL 在真实 PostgreSQL 上执行：advisory lock、空闲切换、过期审批、继续上次。"""
+    h, runner = harness
+
+    async def verify():
+        from kubedoor_ai.wecom import WeComIntegration
+        store, wecom = h.service.store, WeComIntegration(h.service)
+        userid, identity = "wx-" + uuid.uuid4().hex, Identity(h.username, "rw")
+        await store.execute("INSERT INTO kubedoor_ai_wecom_users(wecom_userid) VALUES($1)", userid)
+        try:
+            first, notices, active, reset = await wecom._current_session(userid, identity)
+            assert (notices, active, reset) == ([], None, False)
+            row = await store.one("SELECT channel,channel_key FROM kubedoor_ai_sessions WHERE id=$1::uuid", first)
+            assert row == {"channel": "wecom", "channel_key": f"{userid}:{h.username}:{first}"}
+            assert (await wecom._current_session(userid, identity))[0] == first
+            await store.execute("INSERT INTO kubedoor_ai_messages(id,session_id,role,content) VALUES($1::uuid,$2::uuid,'user','查询 Pod')",
+                                str(uuid.uuid4()), first)
+
+            # 空闲 3 小时后三条消息同时到达：只建一个新对话，只有一条带提示
+            await store.execute("UPDATE kubedoor_ai_sessions SET updated_at=now()-interval '3 hours' WHERE id=$1::uuid", first)
+            results = await asyncio.gather(*(wecom._current_session(userid, identity) for _ in range(3)))
+            second = results[0][0]
+            assert second != first and {r[0] for r in results} == {second}
+            assert sum(bool(r[1]) for r in results) == 1
+            member = await store.one("SELECT session_id,previous_session_id FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+            assert member == {"session_id": second, "previous_session_id": first}
+
+            # 继续上次：切回并刷新最后活跃时间，紧接着的消息不会被空闲切走
+            assert (await wecom._resume_previous_session(userid, identity)).startswith("已回到上一个对话（最后活跃：")
+            assert await wecom._current_session(userid, identity) == (first, [], None, False)
+
+            # 只剩过期审批的任务先被停止
+            run_id = str(uuid.uuid4())
+            await store.execute("INSERT INTO kubedoor_ai_runs(id,session_id,username,permission,status,scope,origin) "
+                                "VALUES($1::uuid,$2::uuid,$3,'rw','waiting_approval',$4,'wecom')", run_id, first, h.username, {"env": "cluster-a"})
+            await store.execute("INSERT INTO kubedoor_ai_actions(id,run_id,call_id,operation,source,arguments,preview,read_only,state,expires_at) "
+                                "VALUES($1::uuid,$2::uuid,$3,'delete_pod','kubedoor','{}','{}',false,'pending',now()-interval '1 minute')",
+                                str(uuid.uuid4()), run_id, run_id + ":expired")
+            session_id, notices, active, _ = await wecom._current_session(userid, identity)
+            assert (session_id, notices, active) == (first, ["上一个待审批的操作已过期，已停止该任务。"], None)
+            assert (await store.one("SELECT status FROM kubedoor_ai_runs WHERE id=$1::uuid", run_id))["status"] == "cancelled"
+
+            # 新对话：当前对话记为上一个
+            assert await wecom._start_new_session(userid, identity) == "已开始新对话。"
+            member = await store.one("SELECT session_id,previous_session_id FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+            assert member["previous_session_id"] == first and member["session_id"] not in (first, second)
+        finally:
+            await store.execute("DELETE FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+
+    runner.run(verify())
+
+
+def test_unreachable_old_wecom_conversation_loses_its_checkpoint_but_keeps_messages(harness):
+    h, runner = harness
+
+    async def verify():
+        from kubedoor_ai.wecom import WeComIntegration
+        store, wecom, checkpointer = h.service.store, WeComIntegration(h.service), h.service.runtime.checkpointer
+        userid, identity = "wx-" + uuid.uuid4().hex, Identity(h.username, "rw")
+        await store.execute("INSERT INTO kubedoor_ai_wecom_users(wecom_userid) VALUES($1)", userid)
+        try:
+            old, *_ = await wecom._current_session(userid, identity)
+            h.model(AIMessage(content="查过了，一切正常"))
+            run, _ = await h.service.new_run(identity, old, {"env": "cluster-a"}, origin="wecom", channel="wecom")
+            await store.message(run, "user", "查一下")
+            await h.service.runtime.run_graph(RunContext(run, identity), Provider.parse(PROVIDER), "查一下", None)
+            assert await checkpointer.aget_tuple({"configurable": {"thread_id": old}}) is not None
+            # 两次「新对话」（中间那个对话有消息）之后，old 既不是当前对话也不是上一个对话
+            await wecom._start_new_session(userid, identity)
+            middle = (await store.one("SELECT session_id FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid))["session_id"]
+            await store.execute("INSERT INTO kubedoor_ai_messages(id,session_id,role,content) VALUES($1::uuid,$2::uuid,'user','再问一句')",
+                                str(uuid.uuid4()), middle)
+            await wecom._start_new_session(userid, identity)
+            await store.execute("UPDATE kubedoor_ai_sessions SET updated_at=now()-interval '8 days' WHERE id=ANY($1::uuid[])", [old, middle])
+            assert await wecom.purge_checkpoints(7) >= 1
+            assert await checkpointer.aget_tuple({"configurable": {"thread_id": old}}) is None
+            row = await store.one("SELECT checkpoint_purged_at,(SELECT count(*) FROM kubedoor_ai_messages m WHERE m.session_id=s.id) AS messages "
+                                  "FROM kubedoor_ai_sessions s WHERE id=$1::uuid", old)
+            assert row["checkpoint_purged_at"] and row["messages"] == 2   # 消息记录保留用于审计
+            # 上一个对话（middle）还能「继续上次」，不清理；旧卡片切不回已清理的 old
+            assert (await store.one("SELECT checkpoint_purged_at FROM kubedoor_ai_sessions WHERE id=$1::uuid", middle))["checkpoint_purged_at"] is None
+            assert (await wecom._continue_session(userid, identity, old))[0] == "该对话已不可用，直接发送问题即可开始新对话。"
+        finally:
+            await store.execute("DELETE FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+
+    runner.run(verify())
+
+
+def test_wecom_clusters_held_questions_binding_and_cleanup_on_postgres(harness):
+    """企微新加的 SQL 在真实 PostgreSQL 上执行：新对话回到默认集群、继续上次恢复集群、被拦下的提问、
+    管理员绑定和绑定码自助绑定、备注、清理成员。"""
+    h, runner = harness
+
+    async def verify():
+        from kubedoor_ai.wecom import WeComIntegration
+        store, wecom = h.service.store, WeComIntegration(h.service)
+        userid, identity = "wx-" + uuid.uuid4().hex, Identity(h.username, "rw")
+        wecom._identity = AsyncMock(return_value=identity)   # 测试 master 不认识这个账号，绑定时只要它有效
+
+        async def member(*columns):
+            return await store.one(f"SELECT {','.join(columns)} FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+
+        await wecom._mapped_user(userid)
+        try:
+            # 第一个对话在 cluster-b 上提问过
+            first, *_ = await wecom._current_session(userid, identity)
+            await wecom._set_current_env(userid, "cluster-b")
+            await store.execute("INSERT INTO kubedoor_ai_runs(id,session_id,username,permission,status,scope,origin) "
+                                "VALUES($1::uuid,$2::uuid,$3,'rw','completed',$4,'wecom')", str(uuid.uuid4()), first, h.username, {"env": "cluster-b"})
+            await store.execute("INSERT INTO kubedoor_ai_messages(id,session_id,role,content) VALUES($1::uuid,$2::uuid,'user','查询 Pod')",
+                                str(uuid.uuid4()), first)
+            # 空闲超时开的新对话回到默认集群；「继续上次」恢复那个对话的集群；新对话按钮带上选的集群
+            await store.execute("UPDATE kubedoor_ai_sessions SET updated_at=now()-interval '3 hours' WHERE id=$1::uuid", first)
+            second, _, _, reset = await wecom._current_session(userid, identity)
+            assert second != first and reset and (await member("current_env"))["current_env"] is None
+            assert (await wecom._resume_previous_session(userid, identity)).endswith("集群：cluster-b）。")
+            assert await member("session_id", "current_env") == {"session_id": first, "current_env": "cluster-b"}
+            await wecom._start_new_session(userid, identity, "cluster-a")
+            assert (await member("current_env"))["current_env"] == "cluster-a"
+
+            # 被拦下的提问并发时只能取走一次，过期的不要，取完或过期都清掉原文
+            await wecom._hold_question(userid, "查一下 Pod")
+            taken = await asyncio.gather(wecom._take_pending(userid), wecom._take_pending(userid))
+            assert sorted(taken, key=bool) == [None, "查一下 Pod"]
+            assert await member("pending_text", "pending_at") == {"pending_text": None, "pending_at": None}
+            await wecom._hold_question(userid, "旧问题")
+            await store.execute("UPDATE kubedoor_ai_wecom_users SET pending_at=now()-interval '11 minutes' WHERE wecom_userid=$1", userid)
+            assert await wecom._take_pending(userid) is None
+            assert (await member("pending_text"))["pending_text"] is None
+            # 新对话时被拦下的提问作废
+            await wecom._hold_question(userid, "上一个对话里的问题")
+            await wecom._start_new_session(userid, identity)
+            assert await member("pending_text", "current_env") == {"pending_text": None, "current_env": None}
+
+            # 管理员绑定记绑定人；只改默认集群不动；解除后清空
+            await wecom.save_user(Identity("admin", "admin"), {"wecom_userid": userid, "username": h.username, "default_env": "cluster-a"})
+            bound = await member("username", "default_env", "current_env", "bound_by", "bound_at")
+            assert (bound["username"], bound["default_env"], bound["current_env"], bound["bound_by"]) == (h.username, "cluster-a", None, "admin")
+            await wecom.save_user(Identity("other-admin", "admin"), {"wecom_userid": userid, "username": h.username, "default_env": "cluster-b"})
+            assert await member("default_env", "bound_by", "bound_at") == {"default_env": "cluster-b", "bound_by": "admin", "bound_at": bound["bound_at"]}
+            # 改绑到别的账号:被拦下的提问作废
+            await wecom._hold_question(userid, "按原来账号问的问题")
+            await wecom.save_user(Identity("admin", "admin"), {"wecom_userid": userid, "username": h.username + "-new", "default_env": None})
+            assert await member("username", "pending_text", "bound_by") == {"username": h.username + "-new", "pending_text": None, "bound_by": "admin"}
+            await wecom.save_user(Identity("admin", "admin"), {"wecom_userid": userid, "username": h.username, "default_env": "cluster-b"})
+            assert await wecom.save_remark(userid, {"remark": "张三（运维）"}) == {"remark": "张三（运维）"}
+            row = next(row for row in await wecom.users() if row["wecom_userid"] == userid)
+            assert (row["remark"], row["bound_by"], row["pending_approvals"]) == ("张三（运维）", "admin", 0)
+            await wecom.delete_user(userid)
+            assert await member("username", "bound_by", "session_id") == {"username": None, "bound_by": None, "session_id": None}
+
+            # 绑定码：再生成会替换旧码；用过即删；输错计数
+            wecom.config = {"enabled": True}
+            stale = (await wecom.create_bind_code(identity))["code"]
+            code = (await wecom.create_bind_code(identity))["code"]
+            assert (await store.one("SELECT count(*) AS n FROM kubedoor_ai_wecom_bind_codes WHERE username=$1", h.username))["n"] == 1
+            if stale != code:
+                assert (await wecom._bind_by_code(userid, stale)).startswith("绑定码不对")
+            assert await wecom._bind_by_code(userid, code) == f"已绑定花折账号 {h.username}，之后按这个账号的权限使用机器人。"
+            assert await member("username", "bound_by", "bind_failures") == {"username": h.username, "bound_by": h.username, "bind_failures": 0}
+            assert (await wecom._bind_by_code(userid, code)).startswith("绑定码不对")
+            assert (await member("bind_failures"))["bind_failures"] == 1
+            assert [item["wecom_userid"] for item in (await wecom.binding(identity))["members"]] == [userid]
+
+            # 清理：成员行和待审批删掉，进行中的任务停掉，对话打标记删检查点（消息保留），旧卡片回不去
+            session_id, *_ = await wecom._current_session(userid, identity)
+            run_id = str(uuid.uuid4())
+            await store.execute("INSERT INTO kubedoor_ai_runs(id,session_id,username,permission,status,scope,origin) "
+                                "VALUES($1::uuid,$2::uuid,$3,'rw','waiting_approval',$4,'wecom')", run_id, session_id, h.username, {"env": "cluster-a"})
+            result = await wecom.purge_member(userid)
+            assert result["success"] and result["stopped"] == 1 and result["sessions"] >= 3
+            assert await store.one("SELECT 1 FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid) is None
+            assert (await store.one("SELECT status FROM kubedoor_ai_runs WHERE id=$1::uuid", run_id))["status"] == "cancelled"
+            sessions = await store.fetch("SELECT checkpoint_purged_at IS NOT NULL AS purged FROM kubedoor_ai_sessions "
+                                         "WHERE channel='wecom' AND starts_with(channel_key,$1)", f"{userid}:")
+            assert sessions and all(row["purged"] for row in sessions)
+            assert (await store.one("SELECT count(*) AS n FROM kubedoor_ai_messages WHERE session_id=$1::uuid", first))["n"] == 1
+            mapped = await wecom._mapped_user(userid)   # 下次发消息按新成员接入
+            assert (mapped["username"], mapped["session_id"], mapped["current_env"]) == (None, None, None)
+            assert (await wecom._continue_session(userid, identity, first))[0] == "该对话已不可用，直接发送问题即可开始新对话。"
+            assert await wecom._session_purged(session_id) and not await wecom._session_purged(str(uuid.uuid4()))
+        finally:
+            await store.execute("DELETE FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+            await store.execute("DELETE FROM kubedoor_ai_wecom_bind_codes WHERE username=$1", h.username)
+
+    runner.run(verify())
+
+
+def test_wecom_cluster_switch_keeps_a_clean_checkpoint_on_postgres(harness):
+    """企微里 AI 请求切换集群:本轮正常结束、切换目标记进任务行;在新集群上重跑的那一轮,
+    Postgres 检查点里是真实的切换结果(没有被当成中断的工具调用补一条)"""
+    h, runner = harness
+
+    async def verify():
+        store, identity, provider = h.service.store, Identity(h.username, "rw"), Provider.parse(PROVIDER)
+        clusters = [{"env": "cluster-a", "permission": "rw"}, {"env": "cluster-b", "permission": "rw"}]
+        sid = await h.session()
+        h.model(AIMessage(content="", tool_calls=[{"name": "kubedoor_tool", "id": "switch-1", "type": "tool_call",
+                                                   "args": {"operation": "switch_cluster", "arguments": {"env": "cluster-b"}, "source": "auto"}}]),
+                AIMessage(content="正在切换到 cluster-b 查询。"), AIMessage(content="cluster-b 一切正常。"))
+        run, _ = await h.service.new_run(identity, sid, {"env": "cluster-a"}, origin="wecom")
+        run["_clusters"] = clusters
+        await store.message(run, "user", "cluster-b 怎么样")
+        await h.service.runtime.run_graph(RunContext(run, identity), provider, "cluster-b 怎么样", None)
+        assert await store.one("SELECT status,switch_env FROM kubedoor_ai_runs WHERE id=$1::uuid", run["id"]) == {
+            "status": "completed", "switch_env": "cluster-b"}
+
+        rerun, _ = await h.service.new_run(identity, sid, {"env": "cluster-b"}, origin="wecom")
+        rerun["_clusters"], rerun["_switched"] = clusters, True
+        await h.service.runtime.run_graph(RunContext(rerun, identity), provider, "已切换到集群 cluster-b，请在这个集群上回答我上一条消息里的问题。", None)
+        assert (await store.one("SELECT status,switch_env FROM kubedoor_ai_runs WHERE id=$1::uuid", rerun["id"])) == {
+            "status": "completed", "switch_env": None}
+        graph = h.service.runtime.graph(RunContext(rerun, identity), provider)
+        messages = (await graph.aget_state({"configurable": {"thread_id": sid}})).values["messages"]
+        results = [text_content(message) for message in messages if isinstance(message, ToolMessage)]
+        assert len(results) == 1 and "已请求切换到集群 cluster-b" in results[0]
+        assert text_content(messages[-1]) == "cluster-b 一切正常。"
+
+    runner.run(verify())
+
+
+def test_wecom_approval_card_is_pushed_and_a_reply_approves_on_postgres(harness):
+    """企微里发起写操作:审批记录存进 kubedoor_ai_wecom_approvals,卡片主动推送(不对那条消息回复卡片,企微不收);
+    成员直接回复「批准」按真实的查询找到这个审批,执行结果流式回在「批准」这条消息里"""
+    h, runner = harness
+
+    async def verify():
+        from kubedoor_ai.wecom import WeComIntegration
+        store, wecom = h.service.store, WeComIntegration(h.service)
+        userid, identity = "wx-" + uuid.uuid4().hex, Identity(h.username, "rw")
+        wecom._identity = AsyncMock(return_value=identity)   # 测试 master 不认识这个账号
+        wecom._member_clusters = AsyncMock(return_value=[{"env": "cluster-a", "permission": "rw"}])
+        wecom.config = {"enabled": True, **PROVIDER}
+        client = wecom.client = SimpleNamespace(is_connected=True, reply_stream=AsyncMock(), send_message=AsyncMock(),
+                                                reply_template_card=AsyncMock(), update_template_card=AsyncMock())
+
+        def frame(text):
+            return {"headers": {"req_id": uuid.uuid4().hex},
+                    "body": {"msgid": uuid.uuid4().hex, "from": {"userid": userid}, "chattype": "single", "text": {"content": text}}}
+
+        await wecom._mapped_user(userid)
+        await store.execute("UPDATE kubedoor_ai_wecom_users SET username=$2,default_env='cluster-a' WHERE wecom_userid=$1", userid, h.username)
+        h.model(tool_message("scale_deployment", {"namespace": "other-ns", "deployment": "app", "replicas": 3}),
+                AIMessage(content="已扩容到 3 个副本。"))
+        try:
+            await wecom._handle_text(frame("把 other-ns/app 扩到 3 个副本"))
+            client.reply_template_card.assert_not_awaited()
+            (chatid, body), = [call.args for call in client.send_message.await_args_list]
+            assert chatid == userid and body["chat_type"] == 1 and body["msgtype"] == "template_card"
+            approval = await store.one("SELECT * FROM kubedoor_ai_wecom_approvals WHERE wecom_userid=$1", userid)
+            assert approval["task_id"] == body["template_card"]["task_id"] and approval["username"] == h.username
+            assert client.reply_stream.await_args.args[2].endswith("请核对后在下方卡片批准或拒绝，也可以直接回复「批准」或「拒绝」。")
+            assert not any(call[1] == "/api/scale" for call in h.upstream)
+
+            await wecom._handle_text(frame("批准"))
+            await h.wait(str(approval["run_id"]))
+            writes = [call for call in h.upstream if call[1] == "/api/scale"]
+            assert len(writes) == 1 and writes[0][3]["deployment_list"] == [{"namespace": "other-ns", "deployment_name": "app", "num": 3}]
+            assert await store.one("SELECT 1 FROM kubedoor_ai_wecom_approvals WHERE wecom_userid=$1", userid) is None
+            final = client.reply_stream.await_args.args[2]
+            assert final.startswith("已扩容到 3 个副本。") and "集群：cluster-a" in final
+        finally:
+            await store.execute("DELETE FROM kubedoor_ai_wecom_users WHERE wecom_userid=$1", userid)
+
+    runner.run(verify())
+
+
+def test_regenerate_and_edit_replace_only_a_safe_last_turn_and_search_finds_sessions(harness):
+    h, runner = harness
+
+    async def verify():
+        sid = await h.session()
+        h.model(AIMessage(content="第一轮回答"), AIMessage(content="第二轮旧回答"), AIMessage(content="第二轮新回答"))
+        for text in ("order-api 为什么重启", "继续看看内存"):
+            response = await h.http.post(f"/api/ai/sessions/{sid}/runs", json={"message": text, "scope": {"env": "cluster-a"}, "provider": PROVIDER})
+            await h.wait(response.json()["run_id"])
+        edit = {"message": "继续看看内存（换个问法）", "scope": {"env": "cluster-a"}, "provider": PROVIDER, "replace_last": True}
+        response = await h.http.post(f"/api/ai/sessions/{sid}/runs", json=edit, headers={"Idempotency-Key": "edit-1"})
+        assert response.status_code == 200, response.text
+        replacement = response.json()["run_id"]
+        await h.wait(replacement)
+        # 同一个幂等键重试返回同一个 run，不会被自己刚建的 run 挡住
+        again = await h.http.post(f"/api/ai/sessions/{sid}/runs", json=edit, headers={"Idempotency-Key": "edit-1"})
+        assert again.status_code == 200 and again.json()["run_id"] == replacement
+        detail = (await h.http.get(f"/api/ai/sessions/{sid}")).json()
+        assert [m["content"] for m in detail["messages"]] == ["order-api 为什么重启", "第一轮回答", "继续看看内存（换个问法）", "第二轮新回答"]
+        replaced = await h.service.store.fetch("SELECT content FROM kubedoor_ai_messages WHERE session_id=$1::uuid AND replaced_at IS NOT NULL ORDER BY created_at", sid)
+        assert [row["content"] for row in replaced] == ["继续看看内存", "第二轮旧回答"]   # 保留用于追溯
+        # 检查点里也只剩第一轮和替换后的第二轮
+        probe = RunContext({"id": "probe", "session_id": sid, "scope": {"env": "cluster-a", "namespace": None, "deployment": None, "pod": None}, "skill_ids": []}, Identity(h.username, "rw"))
+        state = await h.service.runtime.graph(probe, Provider.parse(PROVIDER)).aget_state({"configurable": {"thread_id": sid}})
+        contents = " ".join(str(message.content) for message in state.values["messages"])
+        assert "第二轮新回答" in contents and "第二轮旧回答" not in contents and contents.count("继续看看内存") == 1
+        # 搜索标题和消息内容，不分大小写；% 按字面匹配；被替换的旧消息搜不到
+        found = (await h.http.get("/api/ai/sessions", params={"q": "ORDER-API"})).json()["sessions"]
+        assert [row["id"] for row in found] == [sid] and "order-api 为什么重启" in found[0]["snippet"]
+        assert (await h.http.get("/api/ai/sessions", params={"q": "100%"})).json()["sessions"] == []
+        assert (await h.http.get("/api/ai/sessions", params={"q": "第二轮旧回答"})).json()["sessions"] == []
+        # 最后一轮执行过修改就不能再替换（结果未知的也不行）
+        await h.service.store.execute(
+            "INSERT INTO kubedoor_ai_actions(id,run_id,call_id,operation,source,arguments,preview,read_only,state,result) "
+            "VALUES($1::uuid,$2::uuid,$3,'scale_deployment','kubedoor','{}','{}',false,'failed',$4)",
+            str(uuid.uuid4()), replacement, "call-" + uuid.uuid4().hex, {"success": False, "error": {"code": "partial_failure"}})
+        denied = await h.http.post(f"/api/ai/sessions/{sid}/runs", json=edit)
+        assert denied.status_code == 409 and denied.json()["error"]["code"] == "turn_has_writes"
+
+    runner.run(verify())
+
+
+def mcp_message(tool, arguments, call_id):
+    return AIMessage(content="", tool_calls=[{"name": "mcp_tool", "args": {"server": "remote", "tool": tool, "arguments": arguments},
+                                              "id": call_id, "type": "tool_call"}])
+
+
+def test_user_mcp_servers_are_private_encrypted_and_callable_on_postgres(harness, monkeypatch):
+    h, runner = harness
+    monkeypatch.setenv("NO_PROXY", "*")   # AI 服务连本机的 MCP 时不走开发机的系统代理
+
+    async def verify():
+        async with remote_mcp() as base:
+            url = base + "/mcp?key=url-secret-abcdef"
+            created = await h.http.post("/api/ai/mcp-servers", json={"name": "Remote", "transport": "streamable_http", "url": url,
+                                                                     "headers": [{"name": "X-Token", "value": "good-token"}]})
+            assert created.status_code == 200, created.text
+            server = created.json()
+            sid = server["id"]
+            assert server["last_error"] is None and server["approval"] == "readonly" and server["enabled"] is True
+            assert server["headers"] == [{"name": "X-Token"}] and server["url"] == url
+            assert {tool["name"]: tool["read_only"] for tool in server["tools"]} == {"whoami": True, "create_ticket": False}
+            stored = await h.service.store.one("SELECT encrypted_config,revision FROM kubedoor_ai_mcp_servers WHERE id=$1::uuid", sid)
+            assert b"good-token" not in bytes(stored["encrypted_config"]) and b"url-secret" not in bytes(stored["encrypted_config"])
+            listed = await h.http.get("/api/ai/mcp-servers")
+            assert [item["id"] for item in listed.json()["servers"]] == [sid] and "good-token" not in listed.text
+            # 名称不区分大小写不能重复；别的账号看不到也改不了
+            clash = await h.http.post("/api/ai/mcp-servers", json={"name": "remote", "transport": "sse", "url": base + "/sse",
+                                                                   "headers": [{"name": "X-Token", "value": "x"}]})
+            assert clash.status_code == 409
+            other = {**h.headers, "X-User-Name": "other-" + h.username}
+            assert (await h.http.get("/api/ai/mcp-servers", headers=other)).json() == {"servers": []}
+            assert (await h.http.delete(f"/api/ai/mcp-servers/{sid}", headers=other)).status_code == 404
+            assert (await h.http.patch(f"/api/ai/mcp-servers/{sid}", headers=other, json={"enabled": False})).status_code == 404
+            # 测试和编辑时请求头的值留空，沿用已保存的值；只改名称不改连接配置时版本号不变
+            form = {"id": sid, "name": "remote", "transport": "streamable_http", "url": url, "headers": [{"name": "X-Token", "value": ""}]}
+            tested = (await h.http.post("/api/ai/mcp-servers/test", json=form)).json()
+            assert tested["success"] is True and len(tested["tools"]) == 2, tested
+            wrong = (await h.http.post("/api/ai/mcp-servers/test", json={**form, "headers": [{"name": "X-Token", "value": "bad-token"}]})).json()
+            assert wrong["success"] is False and "HTTP 401" in wrong["error"]
+            assert (await h.http.put(f"/api/ai/mcp-servers/{sid}", json=form)).json()["name"] == "remote"
+            revision = await h.service.store.one("SELECT revision FROM kubedoor_ai_mcp_servers WHERE id=$1::uuid", sid)
+            assert revision["revision"] == stored["revision"]
+
+            # 对话：集群只读的账号也能用、能批准自己接入的 MCP；只读工具自动执行，写工具等批准
+            reader = {**h.headers, "X-User-Permission": "read"}
+            session = (await h.http.post("/api/ai/sessions", json={"title": "MCP"}, headers=reader)).json()["id"]
+            h.model(mcp_message("whoami", {}, "mcp-read"), mcp_message("create_ticket", {"title": "磁盘告警"}, "mcp-write"),
+                    AIMessage(content="工单已创建"))
+            started = await h.http.post(f"/api/ai/sessions/{session}/runs", headers=reader,
+                                        json={"message": "建个工单", "scope": {"env": "cluster-a"}, "provider": PROVIDER})
+            assert started.status_code == 200, started.text
+            rid = started.json()["run_id"]
+            await h.wait(rid, "waiting_approval")
+            pending = (await h.http.get(f"/api/ai/sessions/{session}", headers=reader)).json()["active_run"]["pending_actions"]
+            assert [(item["name"], item["source"]) for item in pending] == [("remote/create_ticket", "mcp")]
+            assert "credential_fingerprint" not in json.dumps(pending)
+            decided = await h.http.post(f"/api/ai/runs/{rid}/decisions", headers=reader,
+                                        json={"action_id": pending[0]["action_id"], "decision": "approve", "provider": PROVIDER})
+            assert decided.status_code == 200, decided.text
+            await h.wait(rid)
+            actions = await h.service.store.fetch("SELECT operation,state,read_only,result FROM kubedoor_ai_actions WHERE run_id=$1::uuid ORDER BY created_at", rid)
+            assert [(item["operation"], item["state"], item["read_only"]) for item in actions] ==                 [("remote/whoami", "succeeded", True), ("remote/create_ticket", "succeeded", False)]
+            # 请求头确实带上了（不是 null），回显的值被去掉；之后几层统一脱敏也不再改写这个占位
+            assert json.loads(actions[0]["result"]["content"]) == {"token": "[redacted]"}
+            assert json.loads(actions[1]["result"]["content"]) == {"id": 7, "title": "磁盘告警"}
+            # 检查点里的用户消息开头是本轮上下文块，列出了 MCP；密钥不进检查点
+            ctx = RunContext({"id": rid, "session_id": session, "scope": {"env": "cluster-a"}, "skill_ids": []}, Identity(h.username, "read"))
+            state = await h.service.runtime.graph(ctx, Provider.parse(PROVIDER)).aget_state({"configurable": {"thread_id": session}})
+            messages = state.values["messages"]
+            user = next(message for message in messages if isinstance(message, HumanMessage))
+            assert '用户接入的 MCP：[{"server":"remote","tools":["whoami","create_ticket"]}]' in text_content(user)
+            assert "good-token" not in str(messages) and "url-secret" not in str(messages)
+
+            # 「重新连接」立即刷新；缓存过期后，提问时只用旧缓存，在后台刷新
+            refreshed = (await h.http.post(f"/api/ai/mcp-servers/{sid}/refresh")).json()
+            assert refreshed["last_error"] is None and len(refreshed["tools"]) == 2, refreshed
+            await h.service.store.execute("UPDATE kubedoor_ai_mcp_servers SET checked_at=now()-interval '1 hour',tools='[]' WHERE id=$1::uuid", sid)
+            stale = await h.service.gateway.mcp.catalogue(Identity(h.username, "read"))
+            assert [item["tools"] for item in stale] == [[]]
+            await asyncio.gather(*list(h.service.gateway.mcp.refreshing.values()))
+            fresh = await h.service.store.one("SELECT tools,checked_at > now()-interval '1 minute' AS recent FROM kubedoor_ai_mcp_servers WHERE id=$1::uuid", sid)
+            assert len(fresh["tools"]) == 2 and fresh["recent"] is True
+
+            # 改了连接配置：版本号加一、重新拿工具列表；停用后不再进本轮目录；删除
+            moved = (await h.http.put(f"/api/ai/mcp-servers/{sid}", json={**form, "transport": "sse", "url": base + "/sse"})).json()
+            assert moved["transport"] == "sse" and moved["last_error"] is None and len(moved["tools"]) == 2, moved
+            revision = await h.service.store.one("SELECT revision FROM kubedoor_ai_mcp_servers WHERE id=$1::uuid", sid)
+            assert revision["revision"] == stored["revision"] + 1
+            assert (await h.http.patch(f"/api/ai/mcp-servers/{sid}", json={"enabled": False})).json()["enabled"] is False
+            assert await h.service.gateway.mcp.catalogue(Identity(h.username, "read")) == []
+            assert (await h.http.delete(f"/api/ai/mcp-servers/{sid}")).json() == {"success": True}
+            assert (await h.http.get("/api/ai/mcp-servers")).json() == {"servers": []}
+
+    runner.run(verify())

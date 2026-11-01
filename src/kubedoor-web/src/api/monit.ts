@@ -1,0 +1,370 @@
+import { http } from "@/utils/http";
+import { getCached, setCache } from "@/utils/cache";
+import type {
+  CodeInfoInvalid,
+  CodeInfoLinks,
+  CodeInfoRequest,
+  RuntimeConfigRequest
+} from "./system";
+
+type ResultTable = {
+  success: boolean;
+  data?: Array<any>;
+  meta?: Array<any>;
+  pods?: Array<any>;
+  message?: string;
+  count: any;
+};
+
+/**
+ * 获取K8S环境列表（缓存5分钟）
+ */
+export const getPromEnv = async () => {
+  const cacheKey = "prom_env";
+  const cached = getCached<ResultTable>(cacheKey);
+  if (cached) return cached;
+
+  const result = await http.request<ResultTable>("get", "/api/prom_env");
+  if (result.success) setCache(cacheKey, result);
+  return result;
+};
+
+/**
+ * 获取命名空间列表（缓存5分钟，flush=true时跳过缓存）
+ * @param env K8S环境
+ */
+export const getPromNamespace = async (env: string, flush?: boolean) => {
+  const cacheKey = `namespaces_${env}`;
+  if (!flush) {
+    const cached = getCached<ResultTable>(cacheKey);
+    if (cached) return cached;
+  }
+
+  const result = await http.request<ResultTable>(
+    "get",
+    "/api/agent/namespaces",
+    {
+      params: { env, flush }
+    }
+  );
+  if (result.success) setCache(cacheKey, result);
+  return result;
+};
+
+/**
+ * 获取服务列表
+ * @param env K8S环境
+ * @param namespace 命名空间
+ */
+export const getPromServices = (env: string, namespace: string) => {
+  return http.request<ResultTable>("get", "/api/prom_services", {
+    params: { env, namespace }
+  });
+};
+
+/**
+ * 获取监控数据
+ * @param env K8S环境
+ * @param ns 命名空间（可选）
+ */
+export const getPromQueryData = (env: string, ns?: string) => {
+  const params: Record<string, string> = { env };
+  if (ns) {
+    params.ns = ns;
+  }
+  return http.request<ResultTable>("get", "/api/prom_query", {
+    params
+  });
+};
+
+/**
+ * 获取Pod数据
+ * @param env K8S环境
+ * @param namespace 命名空间
+ * @param deployment 部署名称
+ * @param options.silent 后台刷新:不显示进度条、出错不弹提示
+ */
+export const getPodData = (
+  env: string,
+  namespace: string,
+  deployment: string,
+  options?: { silent?: boolean }
+) => {
+  return http.request<ResultTable>(
+    "get",
+    "/api/get_dpm_pods",
+    { params: { env, namespace, deployment } },
+    { silent: options?.silent }
+  );
+};
+
+export const updatePodCount = (data?: any) => {
+  return http.request<any>("post", "/api/db/res/pod_count", { data });
+};
+// 获取是否显示"已开启固定节点均衡模式"
+export const showAddLabel = (env: string, namespace: string) => {
+  return http.request<any>("get", "/api/db/agent/show_add_label", {
+    params: { env, namespace }
+  });
+};
+
+/**
+ * 获取Pod重启前日志
+ * @param env K8S环境
+ * @param namespace 命名空间
+ * @param podName Pod名称
+ * @param lines 日志行数（可选，默认100）
+ */
+export const getPodPreviousLogs = (
+  env: string,
+  namespace: string,
+  podName: string,
+  lines: number = 100
+) => {
+  return http.request<any>("get", "/api/pod/get_previous_logs", {
+    params: { env, ns: namespace, pod: podName, lines }
+  });
+};
+
+/**
+ * 下载Pod完整日志（返回gzip压缩文件，超时5分钟）
+ * @param env K8S环境
+ * @param namespace 命名空间
+ * @param podName Pod名称
+ * @param container 容器名称（可选）
+ */
+export const downloadPodLogs = (
+  env: string,
+  namespace: string,
+  podName: string,
+  container?: string
+) => {
+  const params: Record<string, any> = { env, ns: namespace, pod: podName };
+  if (container) {
+    params.container = container;
+  }
+  return http.request<Blob>("get", "/api/pod/download_logs", {
+    params,
+    timeout: 300000,
+    responseType: "blob"
+  });
+};
+
+/**
+ * 创建Pod日志流WebSocket连接URL
+ * @param env K8S环境
+ * @param namespace 命名空间
+ * @param podName Pod名称
+ * @param container 容器名称（可选）
+ * @returns WebSocket连接URL
+ */
+export const createPodLogStreamUrl = (
+  env: string,
+  namespace: string,
+  podName: string,
+  container?: string
+) => {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const host = window.location.host;
+  let url = `${protocol}//${host}/ws/pod-logs?env=${env}&namespace=${namespace}&pod_name=${podName}`;
+  if (container) {
+    url += `&container=${container}`;
+  }
+  return url;
+};
+
+/**
+ * Deployment/Pod 实时状态推送的 WebSocket 地址
+ * @param env K8S环境
+ * @param namespace 命名空间,空表示全部
+ */
+export const createWorkloadStreamUrl = (env: string, namespace: string) => {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const query = `env=${encodeURIComponent(env)}&namespace=${encodeURIComponent(namespace)}`;
+  return `${protocol}//${window.location.host}/ws/workload-status?${query}`;
+};
+
+/**
+ * Pod 终端的 WebSocket 地址(需要目标集群的「网页 Pod 终端」权限)
+ * @param shell auto 自动识别(bash → ash → sh)或指定 bash / ash / sh
+ * @param cols 终端列数,rows 行数:连上后先按这个尺寸打开 shell
+ */
+export const createPodExecUrl = (params: {
+  env: string;
+  namespace: string;
+  pod: string;
+  container?: string;
+  shell?: string;
+  cols?: number;
+  rows?: number;
+}) => {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const query = new URLSearchParams({
+    env: params.env,
+    namespace: params.namespace,
+    pod_name: params.pod
+  });
+  if (params.container) query.set("container", params.container);
+  if (params.shell) query.set("shell", params.shell);
+  if (params.cols) query.set("cols", String(params.cols));
+  if (params.rows) query.set("rows", String(params.rows));
+  return `${protocol}//${window.location.host}/ws/pod-exec?${query}`;
+};
+
+/**
+ * 节点终端的 WebSocket 地址(需要目标集群的「网页节点终端」权限)
+ * agent 会在 kubedoor 命名空间建一个临时特权 pod,用 nsenter 进宿主机命名空间
+ */
+export const createNodeExecUrl = (params: {
+  env: string;
+  node: string;
+  shell?: string;
+  cols?: number;
+  rows?: number;
+}) => {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const query = new URLSearchParams({ env: params.env, node: params.node });
+  if (params.shell) query.set("shell", params.shell);
+  if (params.cols) query.set("cols", String(params.cols));
+  if (params.rows) query.set("rows", String(params.rows));
+  return `${protocol}//${window.location.host}/ws/node-exec?${query}`;
+};
+
+/**
+ * 获取镜像标签列表
+ * @param k8s K8S环境
+ * @param namespace 命名空间
+ * @param deployment 部署名称
+ */
+export const getImageTags = (
+  k8s: string,
+  namespace: string,
+  deployment: string
+) => {
+  return http.request<any>("post", "/api/image/tags", {
+    data: { k8s, namespace, deployment }
+  });
+};
+
+/**
+ * 获取节点资源排名
+ * @param env K8S环境
+ * @param type 资源类型
+ * @param namespace 命名空间
+ * @param deployment 微服务名称
+ */
+export const getNodeResourceRank = (
+  env: string,
+  type: string,
+  namespace?: string,
+  deployment?: string
+) => {
+  const params: any = { env, type };
+  if (namespace) params.namespace = namespace;
+  if (deployment) params.deployment = deployment;
+
+  return http.request<ResultTable>("get", "/api/prom_node_rank", {
+    params
+  });
+};
+
+/**
+ * 获取CCI ScheduleProfile信息
+ * @param env K8S环境
+ * @param namespace 命名空间
+ * @param deployment 微服务名称
+ */
+export const getCciScheduleProfile = (
+  env: string,
+  namespace: string,
+  deployment: string
+) => {
+  return http.request<{ exists: boolean; maxNum: number }>(
+    "get",
+    "/api/cci/schedule-profile",
+    {
+      params: { env, namespace, deployment }
+    }
+  );
+};
+
+/**
+ * 获取代码:master 读 Deployment 第一个容器的镜像,POST 到「系统管理 → 获取代码接口」配置的接口
+ * 出错不弹全局提示,由弹窗显示原因
+ * @param env K8S环境
+ * @param namespace 命名空间
+ * @param deployment 微服务名称
+ */
+export const getCodeInfo = (
+  env: string,
+  namespace: string,
+  deployment: string
+) => {
+  return http.request<{
+    success: boolean;
+    data: {
+      request: CodeInfoRequest;
+      links: CodeInfoLinks;
+      invalid: CodeInfoInvalid;
+    };
+  }>(
+    "get",
+    "/api/code-info",
+    { params: { env, namespace, deployment } },
+    // master 读 Deployment 最长 30 秒 + 调接口最长 60 秒
+    { silent: true, timeout: 100000 }
+  );
+};
+
+/** 获取运行配置的参数:deployment 和 pod 二选一,其他可选 */
+export interface RuntimeConfigQuery {
+  env: string;
+  namespace: string;
+  deployment?: string;
+  pod?: string;
+  container?: string;
+  /** 按配置名过滤的正则,不区分大小写 */
+  keys?: string;
+  /** 附带配置来源 */
+  detail?: boolean;
+  /** 不用缓存,重新采集 */
+  refresh?: boolean;
+}
+
+export interface RuntimeConfigResult {
+  /** 发给接口的请求体(不含 wait) */
+  request: RuntimeConfigRequest;
+  /** 接口返回的 JSON 对象,原样(含明文密码) */
+  config: Record<string, any>;
+  elapsed_ms: number;
+  /** 请求了几次(接口返回 202 时会重试) */
+  attempts: number;
+}
+
+/**
+ * 获取运行配置:master 把集群、命名空间、Deployment / Pod POST 到「系统管理 → 获取运行配置接口」配置的接口,
+ * 返回的 JSON 原样给回来。出错不弹全局提示,由弹窗显示原因
+ */
+export const getRuntimeConfig = (query: RuntimeConfigQuery) => {
+  const params: Record<string, string> = {
+    env: query.env,
+    namespace: query.namespace
+  };
+  if (query.deployment) params.deployment = query.deployment;
+  if (query.pod) params.pod = query.pod;
+  if (query.container) params.container = query.container;
+  if (query.keys) params.keys = query.keys;
+  if (query.detail) params.detail = "1";
+  if (query.refresh) params.refresh = "1";
+  return http.request<{
+    success: boolean;
+    data: RuntimeConfigResult;
+    message?: string;
+  }>(
+    "get",
+    "/api/runtime-config",
+    { params },
+    // 一次获取最长 120 秒(含 202 重试),再留些网络余量
+    { silent: true, timeout: 130000 }
+  );
+};
